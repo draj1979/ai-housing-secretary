@@ -7,6 +7,14 @@
 #   Cloud SQL (optional, alternative to docker-compose's self-hosted
 #   Postgres) · Cloud Storage · Cloud Monitoring · Cloud Logging
 #
+# The VM it creates also comes up ready for GitHub Actions-driven deploys
+# (no SSH key pairs, no service account key file — see
+# scripts/gcp/setup-cicd.sh, which grants the actual IAM access on top of
+# what's below): OS Login enabled, Docker + the Compose plugin installed,
+# Docker pre-authenticated to Artifact Registry via the VM's own attached
+# service account, and a fixed DEPLOY_BASE_DIR directory ready for
+# scripts/gcp/remote-deploy.sh.
+#
 # This is a *documented script*, not a Terraform module (by design — see
 # the project's docs/deployment.md, which this complements): each function
 # below is one resource, checks whether it already exists before creating
@@ -24,8 +32,8 @@
 #
 # After this script, continue with docs/deployment.md from "Install Docker
 # + Compose" onward — this script only creates the GCP resources the VM
-# and app need; it does not SSH in, install Docker, or bring up the app
-# stack.
+# and app need; it does not SSH in or bring up the app stack. Then run
+# scripts/gcp/setup-cicd.sh to wire up GitHub Actions deploys.
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
@@ -63,6 +71,26 @@ VM_IMAGE_FAMILY="${VM_IMAGE_FAMILY:-debian-12}"
 VM_IMAGE_PROJECT="${VM_IMAGE_PROJECT:-debian-cloud}"
 VM_BOOT_DISK_SIZE="${VM_BOOT_DISK_SIZE:-30GB}"
 VM_SERVICE_ACCOUNT_NAME="${VM_SERVICE_ACCOUNT_NAME:-ai-housing-secretary-vm}"
+
+# OS Login (project/instance metadata `enable-oslogin=TRUE`) replaces
+# manually managed SSH key pairs/metadata with IAM-governed SSH: anyone
+# granted roles/compute.osLogin or roles/compute.osAdminLogin on this
+# instance (see scripts/gcp/setup-cicd.sh, which grants it to the
+# GitHub Actions deploy service account) can SSH in using their own GCP
+# identity, no key file to generate/distribute/rotate. On by default —
+# set ENABLE_OS_LOGIN=false only if this project already manages SSH
+# access some other way.
+ENABLE_OS_LOGIN="${ENABLE_OS_LOGIN:-true}"
+
+# Fixed path on the VM where scripts/gcp/remote-deploy.sh (invoked by CI
+# over SSH) expects docker-compose.yml, nginx.conf.template, and a
+# freshly-materialized .env (values pulled from Secret Manager at deploy
+# time, never committed) to live. This script only creates the empty,
+# correctly-owned directory on first boot — CI populates it on first
+# deploy (it doesn't check out the git repo onto the VM at all; only
+# these few files travel over SSH/SCP, matching the "no repo build on the
+# VM" design in docker/docker-compose.yml's header comment).
+DEPLOY_BASE_DIR="${DEPLOY_BASE_DIR:-/opt/ai-housing-secretary}"
 
 STATIC_IP_NAME="${STATIC_IP_NAME:-ai-housing-secretary-ip}"
 
@@ -136,6 +164,8 @@ enable_apis() {
     logging.googleapis.com
     monitoring.googleapis.com
     iam.googleapis.com
+    oslogin.googleapis.com
+    artifactregistry.googleapis.com
   )
   if [[ "${PROVISION_CLOUD_SQL}" == "true" ]]; then
     apis+=(sqladmin.googleapis.com)
@@ -442,10 +472,14 @@ EOF
 
 # -----------------------------------------------------------------------------
 # 8. Compute Engine VM — HLD Sec 14 "Compute Engine | OpenClaw". Boots with
-#    a startup script that installs Docker and the Ops Agent (step 9) so
-#    both are ready the moment you SSH in for docs/deployment.md's
-#    "Install Docker + Compose" step (which then just confirms they're
-#    there, rather than installing from scratch).
+#    a startup script that installs Docker + the Compose plugin, the Ops
+#    Agent, configures Docker to authenticate to Artifact Registry (no key
+#    file — uses the VM's own attached service account via the metadata
+#    server), and creates DEPLOY_BASE_DIR — everything
+#    scripts/gcp/remote-deploy.sh needs already in place the moment CI's
+#    first deploy runs. See docs/deployment.md's "Install Docker +
+#    Compose" step, which then just confirms all this is there rather
+#    than installing from scratch.
 # -----------------------------------------------------------------------------
 
 create_vm() {
@@ -457,27 +491,80 @@ create_vm() {
   local sa_email="${VM_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   local startup_script
   startup_script="$(mktemp)"
-  cat >"${startup_script}" <<'STARTUP'
+  # REGION is substituted below (not left as a startup-script-time
+  # variable) so the Artifact Registry host CI pushes to
+  # (${REGION}-docker.pkg.dev) and the one Docker is configured to trust
+  # here are guaranteed to match, without relying on instance metadata
+  # lookups inside the startup script itself.
+  cat >"${startup_script}" <<STARTUP
 #!/usr/bin/env bash
 set -euo pipefail
-# Docker (docs/deployment.md's "Install Docker + Compose" step — done here
-# too so it's ready immediately on first boot).
+
+# 1. Docker + Compose plugin (docs/deployment.md's "Install Docker +
+#    Compose" step — done here too so it's ready immediately on first
+#    boot). get.docker.com's convenience script already bundles the
+#    compose plugin, but install it explicitly too as a fallback in case
+#    that ever changes upstream — apt no-ops if it's already present.
 if ! command -v docker >/dev/null; then
   curl -fsSL https://get.docker.com | sh
 fi
-# Ops Agent — Cloud Monitoring (VM CPU/mem/disk metrics) + Cloud Logging
-# (VM/system logs). Per-container gateway/worker logs are shipped
-# separately via Docker's own gcplogs driver — see
-# docs/deployment.md's "Cloud Monitoring & Logging" section for why this
-# is two mechanisms, not one, and how to wire gcplogs into docker-compose.
+if ! docker compose version >/dev/null 2>&1; then
+  apt-get update -y
+  apt-get install -y docker-compose-plugin
+fi
+
+# 2. Google Cloud CLI — not present on the base Debian image. Needed for
+#    'gcloud auth configure-docker' (step 3) and useful generally for
+#    on-VM troubleshooting. Same apt-repo-add pattern as the Ops Agent
+#    below, official Google-signed repo.
+if ! command -v gcloud >/dev/null; then
+  apt-get update -y
+  apt-get install -y apt-transport-https ca-certificates gnupg curl
+  install -d -m 0755 /usr/share/keyrings
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+    >/etc/apt/sources.list.d/google-cloud-sdk.list
+  apt-get update -y
+  apt-get install -y google-cloud-cli
+fi
+
+# 3. Docker <-> Artifact Registry auth — configures a docker credential
+#    helper (docker-credential-gcloud) that fetches a short-lived access
+#    token from the VM's own attached service account (via the metadata
+#    server) on every pull/push. No static credential written to disk,
+#    nothing for scripts/gcp/remote-deploy.sh to manage or rotate. Runs
+#    as root (this whole script does, being a startup-script) so it
+#    configures /root/.docker/config.json — matching remote-deploy.sh's
+#    own 'sudo docker compose' invocations, which also run as root.
+gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+# 4. Ops Agent — Cloud Monitoring (VM CPU/mem/disk metrics) + Cloud
+#    Logging (VM/system logs). Per-container gateway/worker logs are
+#    shipped separately via Docker's own gcplogs driver — see
+#    docs/deployment.md's "Cloud Monitoring & Logging" section for why
+#    this is two mechanisms, not one, and how to wire gcplogs into
+#    docker-compose.
 if ! systemctl is-active --quiet google-cloud-ops-agent 2>/dev/null; then
   curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
   bash add-google-cloud-ops-agent-repo.sh --also-install
   rm -f add-google-cloud-ops-agent-repo.sh
 fi
+
+# 5. Fixed deploy directory — scripts/gcp/remote-deploy.sh's cwd. CI
+#    populates docker-compose.yml/nginx.conf.template/.env here on first
+#    deploy (see this function's own header comment); this step only
+#    ensures the directory exists with sane ownership beforehand.
+mkdir -p "${DEPLOY_BASE_DIR}"
+chown root:root "${DEPLOY_BASE_DIR}"
+chmod 0755 "${DEPLOY_BASE_DIR}"
 STARTUP
 
   log "Creating VM ${VM_NAME} (${VM_MACHINE_TYPE}, zone ${ZONE}) — see this script's VM_MACHINE_TYPE comment for sizing rationale"
+  local os_login_metadata=()
+  if [[ "${ENABLE_OS_LOGIN}" == "true" ]]; then
+    os_login_metadata=(--metadata=enable-oslogin=TRUE)
+    log "OS Login enabled on this instance (ENABLE_OS_LOGIN=true) — see scripts/gcp/setup-cicd.sh for granting SSH access via IAM instead of key pairs"
+  fi
   gcloud compute instances create "${VM_NAME}" \
     --project="${PROJECT_ID}" \
     --zone="${ZONE}" \
@@ -489,6 +576,7 @@ STARTUP
     --address="${STATIC_IP_NAME}" \
     --service-account="${sa_email}" \
     --scopes=https://www.googleapis.com/auth/cloud-platform \
+    "${os_login_metadata[@]}" \
     --metadata-from-file=startup-script="${startup_script}"
 
   rm -f "${startup_script}"
@@ -516,8 +604,13 @@ main() {
   1. If PROVISION_DNS=false, point ${DOMAIN}'s A record at the static IP above.
   2. SSH in: gcloud compute ssh ${VM_NAME} --zone=${ZONE} --project=${PROJECT_ID}
      (SSH itself isn't opened by this script's firewall rule — see the note
-     below.)
+     below. Works via your own GCP identity now that OS Login is enabled —
+     no SSH key pair to generate or copy.)
   3. Continue at docs/deployment.md's "Clone the repo and configure secrets" step.
+  4. To let GitHub Actions deploy to this VM without a service account key,
+     run scripts/gcp/setup-cicd.sh next (see docs/deployment.md's "CI/CD Auth"
+     section) — it grants the deploy identity SSH access via the same OS
+     Login mechanism, scoped to just this instance.
 
 Note on SSH access: this script's firewall rule only opens 80/443 (HLD Sec
 14/15's "HTTP/HTTPS only"), on purpose. 'gcloud compute ssh' above works
@@ -532,6 +625,10 @@ SSH rule yourself:
 (35.235.240.0/20 is Google's own IAP range, not "the whole internet" — this
 is deliberately not bundled into create_firewall_rules() above so a plain
 read of that function matches "80/443 only" exactly.)
+
+DEPLOY_BASE_DIR=${DEPLOY_BASE_DIR} was created on the VM for
+scripts/gcp/remote-deploy.sh — CI populates it with docker-compose.yml/
+nginx.conf.template/.env on first deploy; nothing to do here yet.
 EOF
 }
 

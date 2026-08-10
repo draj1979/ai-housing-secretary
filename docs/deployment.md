@@ -66,10 +66,13 @@ newgrp docker
 docker compose version   # bundled with the Docker Engine install above
 ```
 
-(`scripts/provision-gcp.sh`'s VM startup script already installs Docker
-and the Cloud Ops Agent on first boot — this step mostly just confirms
-they're there and gets `docker` working in your current shell session
-without a re-login, via `newgrp docker`.)
+(`scripts/provision-gcp.sh`'s VM startup script already installs Docker,
+the Compose plugin, and the Cloud Ops Agent on first boot, and
+authenticates Docker to this project's Artifact Registry — this step
+mostly just confirms they're there and gets `docker` working in your
+current shell session without a re-login, via `newgrp docker`. The `gcloud
+compute ssh` above works without a manually managed SSH key pair — OS
+Login is on by default, see this doc's "CI/CD Auth" section.)
 
 ## 3. Clone the repo and configure secrets
 
@@ -345,18 +348,58 @@ risk structurally rather than relying on rotation discipline:
 `github-deployer@<project>.iam.gserviceaccount.com` holds exactly two
 grants, both resource-scoped rather than project-wide:
 
-| Role                                                         | Scope                                                 | Purpose                                                                                                                           |
-| ------------------------------------------------------------ | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `roles/artifactregistry.writer`                              | The one `ai-housing-secretary` Artifact Registry repo | Push built `gateway`/`worker`/`broadcast-worker` images                                                                           |
-| `roles/compute.osLogin` + `roles/iap.tunnelResourceAccessor` | The one deploy VM instance                            | SSH in via an IAP tunnel (no open port 22 — see `scripts/provision-gcp.sh`'s firewall note) to run `docker compose pull && up -d` |
+| Role                                                              | Scope                                                 | Purpose                                                                                                                                                                               |
+| ----------------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `roles/artifactregistry.writer`                                   | The one `ai-housing-secretary` Artifact Registry repo | Push built `gateway`/`worker`/`broadcast-worker` images                                                                                                                               |
+| `roles/compute.osAdminLogin` + `roles/iap.tunnelResourceAccessor` | The one deploy VM instance                            | SSH in via an IAP tunnel (no open port 22 — see `scripts/provision-gcp.sh`'s firewall note), as a passwordless-`sudo` OS Login user, to run `scripts/gcp/remote-deploy.sh` unattended |
 
-It cannot read Secret Manager, touch other Compute instances, modify IAM,
-or do anything outside those two resources. `scripts/gcp/setup-cicd.sh`
-has a `DEPLOY_VM_ACCESS_MODE=instance-admin` escape hatch (broader:
+`osAdminLogin` (not the plain `osLogin`) specifically because CI has no
+TTY to answer a `sudo` password prompt — see `scripts/gcp/setup-cicd.sh`'s
+`OS_LOGIN_ROLE` comment for the alternative if you'd rather manage local
+`docker`-group membership yourself. Either way, the deploy SA cannot read
+Secret Manager, touch other Compute instances, modify IAM, or do anything
+outside those two resources. `scripts/gcp/setup-cicd.sh` has a
+`DEPLOY_VM_ACCESS_MODE=instance-admin` escape hatch (broader:
 `roles/compute.instanceAdmin.v1`, still instance-scoped) for workflows
 that need to stop/reset the VM as part of a deploy — off by default.
 
-### Running it
+### What the VM has ready before CI ever connects
+
+`scripts/provision-gcp.sh`'s startup script (Step 8 in this doc) leaves
+the VM ready for exactly this kind of unattended, keyless deploy:
+
+- **OS Login enabled** (`ENABLE_OS_LOGIN=true`, the default) — SSH access
+  is governed by IAM (the roles above), not a manually distributed key
+  pair. This is what lets `github-deployer` SSH in at all.
+- **Docker + the Compose plugin** installed, and **`gcloud auth
+configure-docker`** already run for this project's Artifact Registry
+  region — `docker compose pull` on the VM authenticates via the VM's own
+  attached service account (metadata server), no credential file.
+- **`DEPLOY_BASE_DIR`** (`/opt/ai-housing-secretary` by default) created
+  and ready for `docker-compose.yml`/`.env`/`scripts/gcp/remote-deploy.sh`
+  — see that script's own header for exactly what lands here and when.
+
+### `scripts/gcp/remote-deploy.sh` — what CI actually invokes over SSH
+
+Once connected, CI runs this script (scp'd alongside `docker-compose.yml`
+into `DEPLOY_BASE_DIR`) with `IMAGE_TAG` set to the image it just built
+and pushed:
+
+```bash
+IMAGE_TAG=<git-sha> /opt/ai-housing-secretary/remote-deploy.sh
+```
+
+It: `docker compose pull` (fetches that tag), runs DB migrations
+(`docker compose run --rm gateway node dist/db/migrate.js`),
+`docker compose up -d` (rolls out every service), then polls
+`http://localhost:8080/health` (the gateway directly, bypassing nginx —
+see the script's own comment on why) until it returns `200` or
+`HEALTH_TIMEOUT_SECONDS` (default 60s) elapses, **exiting non-zero on
+timeout** so the CI step goes red on a bad rollout rather than reporting
+success just because containers started. It does not attempt an automatic
+rollback (left to the operator / a future phase — see its header comment).
+
+### Running `setup-cicd.sh`
 
 ```bash
 export PROJECT_ID=your-gcp-project
@@ -401,16 +444,27 @@ Creating real Compute Engine/Cloud SQL/DNS/Storage resources costs money
 and isn't something to do without an explicit go-ahead, so this script was
 **not** run end-to-end against a live project. What was checked instead:
 
-- `bash -n` (syntax) and `shellcheck` (both clean, no warnings).
+- `bash -n` (syntax) and `shellcheck` (both clean, no warnings) — for
+  `provision-gcp.sh`, `scripts/gcp/setup-cicd.sh`, and
+  `scripts/gcp/remote-deploy.sh`.
 - Every non-trivial flag (`--cpu`/`--memory` for Cloud SQL's current custom
   machine-type syntax rather than the older `--tier=db-custom-N-M` string,
   `--public-access-prevention` for Cloud Storage, `--metadata-from-file`
-  for the VM startup script) was confirmed against the installed `gcloud`
+  and `--metadata` used together for the VM startup script + OS Login,
+  `gcloud auth configure-docker`'s positional `REGISTRIES` argument,
+  `gcloud compute instances add-iam-policy-binding`/`gcloud artifacts
+repositories add-iam-policy-binding` for the instance-/repo-scoped IAM
+  grants in `setup-cicd.sh`) was confirmed against the installed `gcloud`
   CLI's own `--help` output — a read-only query, not a resource-creating
   one — rather than assumed from memory.
 - `gcloud compute machine-types list` (read-only) confirmed `e2-medium`
   (the sizing default) is 2 vCPU / 4GB, matching this doc's/the script's
   sizing rationale comments.
+- `docker compose -f docker/docker-compose.yml config` (with
+  `GCP_PROJECT_ID`/`GCP_REGION`/`AR_REPO_NAME`/`IMAGE_TAG` set) confirmed
+  the three app services' new `image:` fields render to the expected
+  Artifact Registry path (`<region>-docker.pkg.dev/<project>/<repo>/app:<tag>`),
+  all three sharing one image reference as intended.
 
 The earlier steps in this document (Docker build, docker-compose stack,
 nginx/TLS bootstrap, healthchecks, a real migration run) _were_ verified
@@ -419,3 +473,8 @@ sections' own notes. `docker/docker-compose.yml`'s `postgres`/`redis`
 services are exactly what a real Compute Engine VM would also run (same
 images, same compose file), so that verification carries over directly;
 only the GCP-resource-creation commands themselves are unexercised here.
+`scripts/gcp/remote-deploy.sh` was similarly not run against a real VM
+(no live deploy target this session) — its `docker compose`
+pull/migrate/up sequence is the same pattern already verified live in the
+sections above, and its healthcheck-polling loop is plain bash with no
+GCP dependency.
