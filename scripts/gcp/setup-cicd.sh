@@ -76,7 +76,15 @@ STAGING_BRANCH="${STAGING_BRANCH:-}"
 
 # How the deploy service account reaches the VM to run the actual deploy
 # (pull the new image, `docker compose up -d`). Two options, both scoped
-# to the single VM instance (never project-wide):
+# to the single VM instance, never project-wide in *effect* — though see
+# create_deploy_service_account() below for a wrinkle confirmed against a
+# real project: roles/iap.tunnelResourceAccessor and (usually)
+# OS_LOGIN_ROLE aren't grantable via Compute's own instance-level IAM API
+# at all (GCP 400s "not supported for this resource"), so those two are
+# actually project-level bindings with an IAM Condition restricting them
+# to this one instance's resource name — same real-world scope, different
+# API surface. roles/compute.instanceAdmin.v1 *is* instance-level-
+# grantable directly, so that one uses the plain instance API.
 #   oslogin         (default, narrower) — OS_LOGIN_ROLE (see below;
 #                    defaults to roles/compute.osAdminLogin, needed for
 #                    unattended `sudo docker compose` — see that var's own
@@ -202,22 +210,37 @@ create_deploy_service_account() {
     --role="roles/artifactregistry.writer" \
     --quiet >/dev/null
 
-  log "Granting roles/iap.tunnelResourceAccessor on ${GCE_VM_NAME} (instance-scoped)"
-  gcloud compute instances add-iam-policy-binding "${GCE_VM_NAME}" \
-    --project="${PROJECT_ID}" \
-    --zone="${GCE_VM_ZONE}" \
+  # roles/iap.tunnelResourceAccessor is NOT one of the roles GCP allows
+  # binding directly on a Compute instance resource (confirmed live via
+  # `gcloud iam list-grantable-roles` against a real instance — it 400s
+  # with "not supported for this resource"; only a handful of roles,
+  # notably roles/compute.osLogin, support that instance-level API at
+  # all). The narrowest mechanism GCP actually offers for this role is a
+  # *project*-level binding with an IAM Condition whose expression
+  # matches only this one instance's resource name — functionally
+  # equivalent scoping, different API surface.
+  local instance_resource="projects/${PROJECT_ID}/zones/${GCE_VM_ZONE}/instances/${GCE_VM_NAME}"
+  local instance_condition="expression=resource.type == \"compute.googleapis.com/Instance\" && resource.name == \"${instance_resource}\",title=${GCE_VM_NAME}-only"
+
+  log "Granting roles/iap.tunnelResourceAccessor on ${GCE_VM_NAME} (project-level binding, IAM Condition scopes it to this instance only)"
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${sa_email}" \
     --role="roles/iap.tunnelResourceAccessor" \
+    --condition="${instance_condition}" \
     --quiet >/dev/null
 
   case "${DEPLOY_VM_ACCESS_MODE}" in
     oslogin)
-      log "Granting ${OS_LOGIN_ROLE} on ${GCE_VM_NAME} (instance-scoped)"
-      gcloud compute instances add-iam-policy-binding "${GCE_VM_NAME}" \
-        --project="${PROJECT_ID}" \
-        --zone="${GCE_VM_ZONE}" \
+      # roles/compute.osLogin *is* instance-level-grantable, but the
+      # default OS_LOGIN_ROLE (osAdminLogin) is not — same "not supported
+      # for this resource" 400 as above — so this uses the same
+      # condition-scoped project-level binding for either value, rather
+      # than branching on which role string was chosen.
+      log "Granting ${OS_LOGIN_ROLE} on ${GCE_VM_NAME} (project-level binding, IAM Condition scopes it to this instance only)"
+      gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
         --member="serviceAccount:${sa_email}" \
         --role="${OS_LOGIN_ROLE}" \
+        --condition="${instance_condition}" \
         --quiet >/dev/null
       ;;
     instance-admin)
