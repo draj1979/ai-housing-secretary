@@ -403,3 +403,12 @@ aes-256-cbc` → `gsutil cp`, 90-day retention.
   `gateway/orchestrator.ts`, `agent/guardrails.ts`, or `agent/escalation.ts` —
   that doc also tracks which HLD Sec 15–17 requirements aren't covered by
   any test yet.
+- **CI** — [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on
+  every PR and every push to `main`/`develop`: lint + typecheck + full
+  test suite with coverage (one job), the guardrail regression suite
+  again as its own independently-visible job ("Safety Guardrails" — see
+  the workflow's own header comment for why it's split out), and a
+  Docker build check (no push). It does not deploy — that's
+  `scripts/gcp/setup-cicd.sh`/`scripts/gcp/remote-deploy.sh`'s WIF-based
+  auth plumbing (`docs/deployment.md`'s "CI/CD Auth" section), wired into
+  an actual deploy workflow in a later phase.
