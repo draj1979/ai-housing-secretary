@@ -1,0 +1,170 @@
+# Local / single-VM deployment stack (HLD Sec 13: Nginx -> OpenClaw Gateway
+# -> PostgreSQL + Redis, with Vector Store colocated with Postgres via
+# pgvector, or run standalone Chroma via the optional profile below).
+#
+# See ../docs/deployment.md for the full bring-up walkthrough (fresh GCE
+# VM, TLS bootstrap, first migration/seed) — this file alone assumes certs
+# already exist and ../.env is filled in.
+#
+# Usage: `docker compose --env-file ../.env -f docker-compose.yml up -d`
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    ports:
+      - '8080:8080'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # HEALTHCHECK is inherited from the image (docker/Dockerfile) — GET
+    # /health, no dependency I/O. `docker compose ps` and nginx's
+    # `depends_on: condition: service_healthy` below both key off it.
+
+  # Consumes the BullMQ queue gateway/webhook.ts publishes to
+  # (gateway/queue.ts) — separate process so the HTTP webhook can respond
+  # within the <5s NFR without waiting on message processing.
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ['node', 'dist/gateway/inboundWorker.js']
+    env_file:
+      - ../.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Not an HTTP server (a BullMQ consumer) — the image's inherited
+    # HEALTHCHECK (which probes port 8080) would always fail here, so it's
+    # disabled rather than misreporting this container as unhealthy.
+    healthcheck:
+      disable: true
+
+  # Consumes gateway/broadcastQueue.ts's delayed jobs (scheduled
+  # announcements, HLD Sec 6.1) — see gateway/broadcastWorker.ts.
+  broadcast-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ['node', 'dist/gateway/broadcastWorker.js']
+    env_file:
+      - ../.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - certbot_webroot:/var/www/certbot:ro
+    environment:
+      # Substituted into nginx.conf.template (see that file's own comment)
+      # — the domain WHATSAPP_CLOUD_API_TOKEN's webhook URL and the TLS
+      # cert are both issued for. Falls back to "_" (nginx's catch-all
+      # server_name) only so `docker compose config` doesn't error with an
+      # unset var; a real deployment always sets DOMAIN in ../.env.
+      DOMAIN: ${DOMAIN:-_}
+    ports:
+      - '80:80'
+      - '443:443'
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # Port 80 only (never 443): before the first `certbot` run, no TLS
+      # cert exists yet and this server block would otherwise be the only
+      # thing keeping the container marked unhealthy during that bootstrap
+      # window — see docs/deployment.md. A 301 redirect still counts as
+      # `curl -f` success (it only treats HTTP >=400 as failure), so this
+      # genuinely checks "is nginx up and answering", nothing more.
+      test: ['CMD', 'curl', '-f', 'http://localhost/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Renews Let's Encrypt certs on a loop (initial issuance is a one-off
+  # `docker compose run` — docs/deployment.md — not this long-running
+  # service, since the very first run needs nginx already serving the
+  # ACME challenge path, which itself needs *some* cert to have started
+  # with — see that doc for the bootstrap order).
+  certbot:
+    image: certbot/certbot:latest
+    volumes:
+      - certbot_certs:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+    entrypoint: >
+      /bin/sh -c "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done;"
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ai_housing_secretary
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    ports:
+      - '6379:6379'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Optional: only needed if VECTOR_DB_PROVIDER=chroma instead of pgvector.
+  chroma:
+    image: chromadb/chroma:latest
+    profiles: ['chroma']
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - '8000:8000'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O- http://localhost:8000/api/v1/heartbeat || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  certbot_certs:
+  certbot_webroot:

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.local
+scripts/provision-gcp.env
+*.log
+.DS_Store
+.pnpm-store/
+drizzle/meta/
+*.tsbuildinfo

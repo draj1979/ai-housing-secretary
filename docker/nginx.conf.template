@@ -1,0 +1,104 @@
+# Reverse proxy for the OpenClaw Gateway (HLD Sec 13, 14, 15).
+#
+# A *template*, not a static config — the official nginx image's entrypoint
+# (`docker-entrypoint.sh`) auto-runs `envsubst` over every file mounted at
+# /etc/nginx/templates/*.template, writing the result to
+# /etc/nginx/conf.d/*.conf before nginx starts. `${DOMAIN}` below comes
+# from the `nginx` service's `DOMAIN` env var (docker-compose.yml) — this
+# is what lets one config file serve any domain without hand-editing it.
+# (nginx's own runtime variables like $host/$scheme are untouched: only
+# names that exist as real container environment variables get substituted,
+# and none of nginx's built-ins are container env vars.)
+#
+# HTTPS-only (HLD Sec 15 "HTTPS only"): the plain-HTTP server block below
+# only ever does two things — serve the Let's Encrypt ACME HTTP-01
+# challenge, or redirect to HTTPS. There is no `location` on it that
+# proxies to the gateway.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    # Let's Encrypt's HTTP-01 validator connects here directly — it must
+    # get a real 200 with the challenge file's content, never a redirect,
+    # or certbot's `--webroot` issuance/renewal fails. This location must
+    # stay *before* the catch-all redirect below, and unauthenticated
+    # (no TLS requirement of its own — that would be circular before a
+    # cert even exists).
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # A basic liveness check unauthenticated + plaintext HTTP is fine for
+    # (docker-compose.yml's nginx healthcheck hits this on port 80 — it
+    # only needs "is nginx itself answering", not "is TLS configured").
+    location = /health {
+        return 200 'ok';
+        add_header Content-Type text/plain;
+    }
+
+    # Everything else: redirect to HTTPS, never proxied.
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name ${DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+
+    # Modern TLS only (HLD Sec 15) — TLS 1.0/1.1 and weak ciphers refused
+    # rather than negotiated down to.
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Tell browsers to never even attempt plain HTTP to this host again
+    # (HLD Sec 15) — belt-and-braces alongside the 301 above.
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    # WhatsApp Cloud API webhook (gateway/webhook.ts) — the one path this
+    # deployment exists to serve. Explicitly allowlisted: this is the only
+    # resident/Meta-facing route proxied through, verified by its own
+    # signature check (tools/whatsappTool.ts's WHATSAPP_APP_SECRET) at the
+    # application layer, not by anything at this layer.
+    location /webhook {
+        proxy_pass http://gateway:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Liveness/readiness (gateway/health.ts) — see docs/deployment.md for
+    # how these are used (Docker healthchecks, manual smoke-testing).
+    location /health {
+        proxy_pass http://gateway:8080;
+    }
+
+    # Internal/admin HTTP endpoints (HLD Sec 15: JWT + role-based access
+    # control — gateway/adminAuth.ts, gateway/adminRoutes.ts) — e.g. a
+    # future committee dashboard. Auth is enforced by the gateway itself
+    # (JWT verification doesn't belong at the proxy layer, where the token
+    # would just be an opaque header), this location only forwards it.
+    location /admin {
+        proxy_pass http://gateway:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # No catch-all location: anything else 404s rather than being proxied,
+    # keeping the gateway's attack surface limited to the paths above.
+}

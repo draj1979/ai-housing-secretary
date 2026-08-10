@@ -1,0 +1,2 @@
+ALTER TABLE "knowledge_documents" ADD COLUMN "content_hash" varchar(64);--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "knowledge_documents_source_uri_idx" ON "knowledge_documents" USING btree ("source_uri");

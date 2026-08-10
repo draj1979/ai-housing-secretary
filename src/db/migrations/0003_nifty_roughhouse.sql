@@ -1,0 +1,2 @@
+CREATE TYPE "public"."escalation_category" AS ENUM('financial_dispute', 'legal_matter', 'committee_decision', 'abuse', 'unknown_question');--> statement-breakpoint
+ALTER TABLE "escalations" ADD COLUMN "category" "escalation_category" DEFAULT 'committee_decision' NOT NULL;

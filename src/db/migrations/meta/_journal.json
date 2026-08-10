@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1786313077012,
+      "tag": "0000_wet_magik",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786314361709,
+      "tag": "0001_knowledge_chunks",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786314783886,
+      "tag": "0002_knowledge_documents_hash",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786334490483,
+      "tag": "0003_nifty_roughhouse",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786336364501,
+      "tag": "0004_lying_taskmaster",
+      "breakpoints": true
+    }
+  ]
+}

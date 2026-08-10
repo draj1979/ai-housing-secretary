@@ -1,0 +1,23 @@
+# Never bake these into an image (HLD Sec 15 — secrets come from GCP
+# Secret Manager at boot, not from files shipped in the image).
+.env
+.env.local
+.env.*.local
+
+# Build/dev artifacts not needed inside the build context.
+node_modules
+dist
+coverage
+.git
+.github
+
+# Editor/OS cruft.
+.vscode
+.idea
+.DS_Store
+*.log
+
+# Not needed at build time; docs/tests aren't part of the runtime image.
+docs
+*.md
+docker
