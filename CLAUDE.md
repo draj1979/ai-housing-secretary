@@ -410,12 +410,15 @@ aes-256-cbc` → `gsutil cp`, 90-day retention.
   the workflow's own header comment for why it's split out), and a
   Docker build check (no push).
 - **CD** — [`.github/workflows/cd.yml`](.github/workflows/cd.yml) fires
-  via `workflow_run` once CI passes on `main`: builds and pushes
-  `docker/Dockerfile` to Artifact Registry (tags `latest` + short SHA) via
+  via `workflow_run` once CI passes on `main`. Two jobs, one shared
+  approval: `build-and-push` builds and pushes `docker/Dockerfile` to
+  Artifact Registry (tags `latest` + short SHA); `deploy` then SSHes into
+  the VM (IAP tunnel, OS Login, no static keys) and runs
+  `scripts/gcp/remote-deploy.sh <short-sha>`, automatically rolling back
+  to the VM's recorded `.last-good-tag` — and still failing the workflow
+  either way — if the new deploy's healthcheck fails. Both via
   `scripts/gcp/setup-cicd.sh`'s WIF auth (`docs/deployment.md`'s "CI/CD
-  Auth" section) — no service account key. The `build-and-push` job sits
-  behind a `production` GitHub Environment with a required reviewer
-  (Section 2's human-in-the-loop principle, applied to the deploy
-  pipeline itself, not just the app). Scope stops at "image pushed" —
-  rolling it out to the VM (`scripts/gcp/remote-deploy.sh`, over IAP-
-  tunneled SSH) is still a later phase.
+  Auth" section) — no service account key anywhere. Both jobs sit behind
+  a `production` GitHub Environment with a required reviewer (Section 2's
+  human-in-the-loop principle, applied to the deploy pipeline itself, not
+  just the app).

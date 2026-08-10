@@ -449,19 +449,54 @@ workflow's own "Checkout" step comment for why that distinction matters).
 Reuses `ci.yml`'s Docker Build job's `type=gha` cache layer, so this is
 usually a fast, mostly-cached push rather than a cold rebuild.
 
-**Scope**: build + push only. Rolling the new image out to the VM
-(`scripts/gcp/remote-deploy.sh`, over the IAP-tunneled SSH
-`github-deployer` already has) is a later phase — this file stops at
-"the image exists in Artifact Registry, tagged and ready."
+A second job, `deploy`, `needs: build-and-push` and rolls the just-pushed
+tag out to the VM.
+
+#### `deploy` — SSH out, run `remote-deploy.sh`, roll back automatically on failure
+
+Authenticates the same WIF way, then `gcloud compute ssh`/`scp
+--tunnel-through-iap` — the same OS Login + IAP mechanism
+`scripts/provision-gcp.sh` (enables OS Login) and `scripts/gcp/setup-cicd.sh`
+(grants `github-deployer` `roles/compute.osAdminLogin` +
+`roles/iap.tunnelResourceAccessor`, scoped to the one VM instance) already
+set up — no SSH key pair anywhere, `gcloud` generates and registers an
+ephemeral one per run via the OS Login API.
+
+1. **Sync**: `docker/docker-compose.yml` and `scripts/gcp/remote-deploy.sh`
+   are scp'd to the VM (to the login user's home, then moved into the
+   root-owned `DEPLOY_BASE_DIR` with `sudo install`) — so a change to
+   either file in this repo takes effect on the very next deploy, not
+   just at VM provisioning time.
+2. **Deploy**: `remote-deploy.sh <short-sha>` runs over SSH — its own
+   stdout/stderr stream straight into the workflow log (nothing
+   redirected), so `docker compose pull`/migration output/healthcheck
+   polling are all visible in the Actions UI as they happen.
+3. **Automatic rollback on failure**: if `remote-deploy.sh` exits
+   non-zero (its own healthcheck timeout, per its header comment), the
+   job reads `DEPLOY_BASE_DIR/.last-good-tag` off the VM (a plain SSH
+   `cat` — that file is written by `remote-deploy.sh` itself, right after
+   _its own_ successful healthcheck, on every deploy) and re-invokes
+   `remote-deploy.sh` with that previous tag. **Either way, the job still
+   exits non-zero** — a successful automatic rollback still fails the
+   workflow, on purpose, so a bad deploy is always visible in PR/commit
+   checks rather than silently self-healed into looking like nothing
+   happened. If there's no `.last-good-tag` yet (the very first deploy
+   ever), there's nothing to roll back to — that's called out explicitly
+   in the log rather than attempted anyway.
+4. **On success**: a deploy summary (commit, tag, time, who approved —
+   fetched from this run's own deployment-approval record via `gh api`,
+   falling back to whoever triggered the underlying CI run) is written to
+   the workflow's Job Summary.
 
 #### The "production" Environment — the human-in-the-loop gate
 
-`build-and-push`'s job-level `environment: { name: production }` means
-the job does not start — auth, build, and push all wait — until a
-required reviewer approves it in GitHub's Environments UI. This is the
-same "nothing ships without a human" rule CLAUDE.md Sec 2 requires of the
-app itself (broadcasts: draft -> AI improves -> **secretary approves** ->
-send), applied to the deploy pipeline.
+Both jobs' `environment: { name: production }` means neither starts —
+`build-and-push`'s auth/build/push, and separately `deploy`'s SSH/rollout
+— until a required reviewer approves. GitHub shares one approval across
+every job in a run that targets the same environment, so this is a single
+click, not two. Same "nothing ships without a human" rule CLAUDE.md
+Sec 2 requires of the app itself (broadcasts: draft -> AI improves ->
+**secretary approves** -> send), applied to the deploy pipeline.
 
 Creating the Environment and its required reviewers is a repo-settings
 action, not something this YAML file can declare on its own — either

@@ -16,9 +16,12 @@
 #   4. Poll the local healthcheck endpoint until it returns 200 or
 #      HEALTH_TIMEOUT_SECONDS elapses — exits non-zero on timeout, which
 #      is CI's signal that the deploy failed and the workflow step should
-#      go red (this script does not attempt an automatic rollback; that's
-#      intentionally left to the operator/a future phase, since rolling
-#      back safely also needs to consider in-flight DB migrations).
+#      go red. This script itself does not roll back (it wouldn't know
+#      what "the previous good tag" was without CD's own bookkeeping) —
+#      .github/workflows/cd.yml's deploy job reads LAST_GOOD_TAG_FILE
+#      (below) and re-invokes this same script with that tag when a
+#      deploy's healthcheck fails, then still fails the workflow so the
+#      rollback is visible rather than silently swallowed.
 #
 # Expects DEPLOY_BASE_DIR (default /opt/ai-housing-secretary — see
 # scripts/provision-gcp.sh, which creates it) to already contain
@@ -29,20 +32,27 @@
 # values from Secret Manager themselves at boot, via this VM's own
 # attached service account; nothing secret is ever written into .env by
 # this script). What *does* change per deploy is IMAGE_TAG (e.g. the git
-# SHA just built) — pass it as an env var to this script; it is not
-# persisted back into .env.
+# SHA just built) — pass it as the first argument (what CI does) or as an
+# env var; neither is persisted back into .env.
+#
+# On a successful deploy (healthcheck passed), IMAGE_TAG is recorded to
+# LAST_GOOD_TAG_FILE (default DEPLOY_BASE_DIR/.last-good-tag) — this is
+# the file CD's rollback step reads.
 #
 # Usage (as CI invokes it):
-#   IMAGE_TAG=<git-sha> ./remote-deploy.sh
+#   ./remote-deploy.sh <git-sha>
+#   # or: IMAGE_TAG=<git-sha> ./remote-deploy.sh
 set -euo pipefail
 
 DEPLOY_BASE_DIR="${DEPLOY_BASE_DIR:-/opt/ai-housing-secretary}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 ENV_FILE="${ENV_FILE:-.env}"
+LAST_GOOD_TAG_FILE="${LAST_GOOD_TAG_FILE:-${DEPLOY_BASE_DIR}/.last-good-tag}"
 
-# Same IMAGE_TAG default as docker/docker-compose.yml's `image:` fields —
-# kept in sync deliberately (see that file's own header comment).
-IMAGE_TAG="${IMAGE_TAG:-latest}"
+# Positional arg wins over the env var, which wins over the same
+# "latest" default docker/docker-compose.yml's `image:` fields use (see
+# that file's own header comment) — kept in sync deliberately.
+IMAGE_TAG="${1:-${IMAGE_TAG:-latest}}"
 export IMAGE_TAG
 
 # What "healthy" means for step 4. Deliberately the gateway's own port
@@ -160,6 +170,24 @@ wait_for_healthy() {
   return 1
 }
 
+# -----------------------------------------------------------------------------
+# 5. Record this as the last known-good tag — only reached if
+#    wait_for_healthy returned 0. .github/workflows/cd.yml's deploy job
+#    reads this file (a plain SSH `cat`, no special tooling) when a
+#    *later* deploy fails, to know what to roll back to. Uses the same
+#    DOCKER_CMD-derived sudo resolution as everything else in this
+#    script, since DEPLOY_BASE_DIR is root-owned (scripts/provision-gcp.sh).
+# -----------------------------------------------------------------------------
+
+record_last_good_tag() {
+  if [[ "${DOCKER_CMD[0]}" == "sudo" ]]; then
+    echo "${IMAGE_TAG}" | sudo -n tee "${LAST_GOOD_TAG_FILE}" >/dev/null
+  else
+    echo "${IMAGE_TAG}" >"${LAST_GOOD_TAG_FILE}"
+  fi
+  log "Recorded ${IMAGE_TAG} as the last known-good tag (${LAST_GOOD_TAG_FILE})"
+}
+
 main() {
   require_files
   resolve_docker_cmd
@@ -167,6 +195,7 @@ main() {
   run_migrations
   roll_out
   wait_for_healthy
+  record_last_good_tag
   log "Deploy complete (IMAGE_TAG=${IMAGE_TAG})"
 }
 
