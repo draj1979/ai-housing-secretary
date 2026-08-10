@@ -408,7 +408,14 @@ aes-256-cbc` → `gsutil cp`, 90-day retention.
   test suite with coverage (one job), the guardrail regression suite
   again as its own independently-visible job ("Safety Guardrails" — see
   the workflow's own header comment for why it's split out), and a
-  Docker build check (no push). It does not deploy — that's
-  `scripts/gcp/setup-cicd.sh`/`scripts/gcp/remote-deploy.sh`'s WIF-based
-  auth plumbing (`docs/deployment.md`'s "CI/CD Auth" section), wired into
-  an actual deploy workflow in a later phase.
+  Docker build check (no push).
+- **CD** — [`.github/workflows/cd.yml`](.github/workflows/cd.yml) fires
+  via `workflow_run` once CI passes on `main`: builds and pushes
+  `docker/Dockerfile` to Artifact Registry (tags `latest` + short SHA) via
+  `scripts/gcp/setup-cicd.sh`'s WIF auth (`docs/deployment.md`'s "CI/CD
+  Auth" section) — no service account key. The `build-and-push` job sits
+  behind a `production` GitHub Environment with a required reviewer
+  (Section 2's human-in-the-loop principle, applied to the deploy
+  pipeline itself, not just the app). Scope stops at "image pushed" —
+  rolling it out to the VM (`scripts/gcp/remote-deploy.sh`, over IAP-
+  tunneled SSH) is still a later phase.

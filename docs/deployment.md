@@ -314,9 +314,10 @@ changed.
 build/push images and deploy to this VM — an Artifact Registry repo, a
 dedicated `github-deployer@<project>.iam` service account, and a Workload
 Identity Federation (WIF) pool/provider — **without ever creating or
-downloading a GCP service account JSON key**. (The GitHub Actions workflow
-itself is a later phase; this section documents the auth plumbing it will
-use.)
+downloading a GCP service account JSON key**. `.github/workflows/cd.yml`
+is what actually consumes this (build + push, gated behind human
+approval — see its own subsection below); rolling the pushed image out to
+the VM itself is still a later phase.
 
 ### Why no key file
 
@@ -413,11 +414,13 @@ re-run: every resource is describe-before-create and every IAM binding is
 additive, so re-running after setting `STAGING_BRANCH` (to allow deploys
 from `develop`, say) only adds the new binding.
 
-It prints, at the end, the six values to add as GitHub Actions repo
-secrets/variables — `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT`,
-`GCP_PROJECT_ID`, `ARTIFACT_REGISTRY_REGION`, `GCE_VM_NAME`,
-`GCE_VM_ZONE` — which the (not-yet-written) CI workflow will consume via
-[`google-github-actions/auth`](https://github.com/google-github-actions/auth):
+It prints, at the end, six values. `.github/workflows/cd.yml` consumes
+them as **repo secrets** (`WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT` — the pair
+that together identify exactly what a workflow can impersonate) and
+**repo variables** (`GCP_PROJECT_ID`, `ARTIFACT_REGISTRY_REGION` — plain,
+non-sensitive identifiers; `GCE_VM_NAME`/`GCE_VM_ZONE` aren't used by
+`cd.yml` yet, only by a later VM-rollout phase). Add them at Settings ->
+Secrets and variables -> Actions, matching that split:
 
 ```yaml
 - uses: google-github-actions/auth@v2
@@ -425,6 +428,64 @@ secrets/variables — `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT`,
     workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
     service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 ```
+
+### `.github/workflows/cd.yml` — build & push after CI passes
+
+Triggered by `workflow_run` watching `.github/workflows/ci.yml`'s "CI"
+workflow (not its own `push: branches: [main]`) so it reuses CI's
+already-completed lint/typecheck/test/guardrails/docker-build result
+instead of re-running those checks a second time — `ci.yml` alone still
+defines what "passing" means. The job itself guards against a
+_completed-but-failed_ CI run with `if:
+github.event.workflow_run.conclusion == 'success'`.
+
+It authenticates via the same WIF plumbing above (`token_format:
+access_token`, fed straight into `docker/login-action` — no `gcloud` CLI
+needed on the runner), then builds and pushes `docker/Dockerfile` to
+Artifact Registry tagged both `latest` and the short git SHA of the exact
+commit CI tested (`github.event.workflow_run.head_sha`, not whatever
+`main` happens to point at when the job actually starts — see the
+workflow's own "Checkout" step comment for why that distinction matters).
+Reuses `ci.yml`'s Docker Build job's `type=gha` cache layer, so this is
+usually a fast, mostly-cached push rather than a cold rebuild.
+
+**Scope**: build + push only. Rolling the new image out to the VM
+(`scripts/gcp/remote-deploy.sh`, over the IAP-tunneled SSH
+`github-deployer` already has) is a later phase — this file stops at
+"the image exists in Artifact Registry, tagged and ready."
+
+#### The "production" Environment — the human-in-the-loop gate
+
+`build-and-push`'s job-level `environment: { name: production }` means
+the job does not start — auth, build, and push all wait — until a
+required reviewer approves it in GitHub's Environments UI. This is the
+same "nothing ships without a human" rule CLAUDE.md Sec 2 requires of the
+app itself (broadcasts: draft -> AI improves -> **secretary approves** ->
+send), applied to the deploy pipeline.
+
+Creating the Environment and its required reviewers is a repo-settings
+action, not something this YAML file can declare on its own — either
+through Settings -> Environments -> New environment named exactly
+`production` -> add required reviewers, or via `gh api` (what was
+actually run for this repo):
+
+```bash
+gh api -X PUT repos/<owner>/<repo>/environments/production \
+  -H "Accept: application/vnd.github+json" \
+  -f 'reviewers[][type]=User' -F 'reviewers[][id]=<reviewer-user-id>' \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+
+# Restrict deployments to main only (matches cd.yml's own workflow_run
+# branches: [main] filter, belt-and-braces):
+gh api -X POST repos/<owner>/<repo>/environments/production/deployment-branch-policies \
+  -f 'name=main'
+```
+
+Environment protection rules (required reviewers) need the repo to be
+public, or private on a paid GitHub plan — same constraint this repo hit
+setting up branch protection (see that section's own history) — this
+repo is public, so it worked directly.
 
 ## Vector store: PGVector (default) vs ChromaDB
 
