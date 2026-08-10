@@ -1,0 +1,141 @@
+# CD — builds and pushes the Docker image to Artifact Registry after CI
+# passes on main.
+#
+# Triggered by `workflow_run` watching the "CI" workflow (.github/workflows/ci.yml)
+# rather than its own `push: branches: [main]`, on purpose: this reuses
+# CI's already-completed lint/typecheck/test/guardrails/docker-build
+# result instead of re-running those checks a second time (cheaper, and
+# there's only one place — ci.yml — that defines what "passing" means).
+# `branches: [main]` on the trigger further narrows this to CI runs whose
+# head branch was main (i.e. the push-to-main run, not a PR run against
+# some feature branch) — see the job-level `if:` below for the other half
+# of this gate (a *completed* run isn't necessarily a *successful* one).
+#
+# No GCP service account key anywhere in this file — auth is Workload
+# Identity Federation via google-github-actions/auth, exchanging GitHub's
+# own OIDC token for short-lived GCP credentials scoped to exactly this
+# run. See scripts/gcp/setup-cicd.sh (which provisions the WIF pool/
+# provider/deploy service account this depends on) and
+# docs/deployment.md's "CI/CD Auth" section for the full design.
+#
+# Scope of this workflow: build + push only (tags: `latest` and the short
+# git SHA), gated behind a GitHub Environment ("production") with
+# required reviewers — matching CLAUDE.md Sec 2's human-in-the-loop
+# principle, the same "nothing ships without a human" rule the app itself
+# enforces for broadcasts. Actually rolling the new image out to the VM
+# is a later phase's job, not this file's — that will mean SSHing in
+# (via the IAP tunnel scripts/gcp/setup-cicd.sh's deploy service account
+# can already reach) and running scripts/gcp/remote-deploy.sh with
+# IMAGE_TAG set to this run's short SHA.
+#
+# One-time manual setup this file cannot do for you: creating the
+# "production" Environment itself and adding required reviewers is a
+# repo-settings action (Settings -> Environments -> New environment ->
+# "production" -> Required reviewers), not something declarable in this
+# YAML — see docs/deployment.md's "CI/CD Auth" section for the exact
+# steps (or the `gh api` equivalent) if it isn't already configured.
+name: CD
+
+on:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+    branches: [main]
+
+# Never cancel an in-progress deploy for a newer push — queue instead, so
+# two overlapping runs can't push half-finished/out-of-order image tags.
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Required for google-github-actions/auth to mint a Workload Identity
+  # Federation token — nothing else in this workflow needs elevated
+  # permissions.
+  id-token: write
+
+jobs:
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    # workflow_run always fires on completion, success or failure — this
+    # is what actually stops a failed CI run from triggering a deploy.
+    if: github.event.workflow_run.conclusion == 'success'
+
+    # Protected GitHub Environment: this job does not start at all until
+    # a required reviewer approves it in the Environments UI (Settings ->
+    # Environments -> production). Deliberately gates the *whole* job
+    # (auth + build + push), not just a single step — there's no partial-
+    # credential-then-wait mechanism in Actions, so "approve before
+    # anything GCP-facing happens" means the environment sits on the job.
+    environment:
+      name: production
+
+    steps:
+      # Check out the exact commit CI tested and passed — not whatever
+      # main happens to point at right now (which could have moved if
+      # another push landed while this run was queued/waiting on
+      # approval). This is the one correctness-critical use of
+      # `head_sha` in this file; every tag below derives from it too.
+      - name: Checkout (commit CI actually tested)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Compute short SHA
+        id: sha
+        run: |
+          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      # WIF — exchanges GitHub's OIDC token for a short-lived GCP access
+      # token, scoped to whatever roles scripts/gcp/setup-cicd.sh granted
+      # github-deployer@ (artifactregistry.writer on this one repo,
+      # nothing project-wide). token_format=access_token is what
+      # docker/login-action below consumes; no key file, nothing to
+      # revoke afterward because nothing long-lived was issued.
+      - name: Authenticate to GCP (Workload Identity Federation)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      # Registry login uses the WIF access token above directly — no
+      # separate `gcloud auth configure-docker` / gcloud CLI install
+      # needed on the runner.
+      - name: Log in to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Image path matches docker/docker-compose.yml's `image:` fields
+      # exactly (${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPO_NAME}/app)
+      # so scripts/gcp/remote-deploy.sh's `docker compose pull` — with
+      # IMAGE_TAG set to this run's short SHA — finds exactly what this
+      # step pushed. AR_REPO_NAME defaults to "ai-housing-secretary",
+      # matching scripts/gcp/setup-cicd.sh's own AR_REPO_NAME default;
+      # override via a repo variable of the same name if that was ever
+      # changed at provisioning time.
+      - name: 'Build and push (tags: latest + short SHA)'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: |
+            ${{ vars.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO_NAME || 'ai-housing-secretary' }}/app:latest
+            ${{ vars.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO_NAME || 'ai-housing-secretary' }}/app:${{ steps.sha.outputs.short }}
+          # Reuses ci.yml's Docker Build job's GitHub Actions cache layer
+          # (same context/Dockerfile, cache-to: gha,mode=max there) —
+          # this push is usually near-instant on top of it rather than a
+          # cold rebuild.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
