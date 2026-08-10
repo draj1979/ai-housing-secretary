@@ -18,22 +18,36 @@
 # provider/deploy service account this depends on) and
 # docs/deployment.md's "CI/CD Auth" section for the full design.
 #
-# Scope of this workflow: build + push only (tags: `latest` and the short
-# git SHA), gated behind a GitHub Environment ("production") with
+# Two jobs, both gated behind a GitHub Environment ("production") with
 # required reviewers — matching CLAUDE.md Sec 2's human-in-the-loop
 # principle, the same "nothing ships without a human" rule the app itself
-# enforces for broadcasts. Actually rolling the new image out to the VM
-# is a later phase's job, not this file's — that will mean SSHing in
-# (via the IAP tunnel scripts/gcp/setup-cicd.sh's deploy service account
-# can already reach) and running scripts/gcp/remote-deploy.sh with
-# IMAGE_TAG set to this run's short SHA.
+# enforces for broadcasts. GitHub shares one approval across every job in
+# a run that references the same environment, so a reviewer approves
+# once and both jobs below proceed:
+#
+#   1. build-and-push — builds docker/Dockerfile, tags `latest` + the
+#      short git SHA of the exact commit CI tested, pushes both to
+#      Artifact Registry.
+#   2. deploy — SSHes into the VM (IAP tunnel, OS Login, no static keys —
+#      scripts/gcp/setup-cicd.sh's deploy service account) and runs
+#      scripts/gcp/remote-deploy.sh with the new tag. If remote-deploy.sh's
+#      own healthcheck fails, this job reads the VM's `.last-good-tag`
+#      file and re-invokes remote-deploy.sh with *that* tag as an
+#      automatic rollback — then still fails the workflow regardless of
+#      whether the rollback itself succeeded, so a bad deploy is always
+#      visible, never silently absorbed. See that job's own comments for
+#      the full sequence.
 #
 # One-time manual setup this file cannot do for you: creating the
 # "production" Environment itself and adding required reviewers is a
 # repo-settings action (Settings -> Environments -> New environment ->
 # "production" -> Required reviewers), not something declarable in this
 # YAML — see docs/deployment.md's "CI/CD Auth" section for the exact
-# steps (or the `gh api` equivalent) if it isn't already configured.
+# steps (or the `gh api` equivalent) if it isn't already configured. The
+# deploy job also needs `gcloud compute ssh --tunnel-through-iap` to
+# actually reach the VM — scripts/provision-gcp.sh's printed setup notes
+# cover enabling IAP TCP forwarding / the allow-ssh-iap firewall rule if
+# that's not already in place.
 name: CD
 
 on:
@@ -139,3 +153,193 @@ jobs:
           # cold rebuild.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Deploy — SSHes into the deploy VM and runs scripts/gcp/remote-deploy.sh
+  # with the tag build-and-push just pushed. See this workflow's own
+  # header comment for the shared-approval design (one reviewer click
+  # covers both jobs) and scripts/gcp/remote-deploy.sh's header for what
+  # it does once invoked (pull -> migrate -> up -d -> healthcheck ->
+  # record .last-good-tag).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to VM
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    permissions:
+      contents: read
+      id-token: write
+      # Read-only access to this run's own deployment-approval records
+      # (Get deployment approver step below) — nothing else in this job
+      # needs elevated GITHUB_TOKEN permissions beyond the workflow's own
+      # contents/id-token defaults.
+      actions: read
+    env:
+      # Must match scripts/provision-gcp.sh's DEPLOY_BASE_DIR default —
+      # not one of scripts/gcp/setup-cicd.sh's six printed repo
+      # variables, so it isn't parameterized via `vars.*` here; update
+      # this literal if that default is ever changed at provisioning time.
+      DEPLOY_BASE_DIR: /opt/ai-housing-secretary
+
+    steps:
+      # Only needed so the two files below (docker-compose.yml,
+      # remote-deploy.sh) exist locally to scp up — this job never
+      # checks out the full repo onto the VM itself (see
+      # docker/docker-compose.yml's own header comment on why: images
+      # come from Artifact Registry, not a local build).
+      - name: Checkout (commit CI actually tested)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Compute short SHA
+        id: sha
+        run: |
+          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      # gcloud CLI, wired to the WIF credentials the auth step above just
+      # minted — `gcloud compute ssh`/`scp` below need the CLI itself,
+      # not just an ADC credentials file.
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # `gcloud compute ssh`/`scp --tunnel-through-iap` is the same
+      # OS Login + IAP mechanism scripts/provision-gcp.sh (enables OS
+      # Login) and scripts/gcp/setup-cicd.sh (grants github-deployer
+      # roles/compute.osAdminLogin + roles/iap.tunnelResourceAccessor,
+      # scoped to this one instance) set up — no SSH key pair to manage,
+      # gcloud generates and registers an ephemeral one per run via the
+      # OS Login API. `--quiet` suppresses interactive prompts (safe to
+      # always answer yes non-interactively here — there's nothing to
+      # confirm beyond "generate a throwaway key").
+      #
+      # DEPLOY_BASE_DIR is root-owned 0755 (scripts/provision-gcp.sh), so
+      # these can't scp directly into it — copy to the login user's home
+      # first, then move into place with sudo over a second SSH call.
+      - name: Sync docker-compose.yml + remote-deploy.sh to the VM
+        run: |
+          set -euo pipefail
+          COMMON_FLAGS=(--zone="${{ vars.GCE_VM_ZONE }}" --project="${{ vars.GCP_PROJECT_ID }}" --tunnel-through-iap --quiet)
+
+          gcloud compute scp "${COMMON_FLAGS[@]}" \
+            docker/docker-compose.yml "${{ vars.GCE_VM_NAME }}:~/docker-compose.yml.new"
+          gcloud compute scp "${COMMON_FLAGS[@]}" \
+            scripts/gcp/remote-deploy.sh "${{ vars.GCE_VM_NAME }}:~/remote-deploy.sh.new"
+
+          gcloud compute ssh "${{ vars.GCE_VM_NAME }}" "${COMMON_FLAGS[@]}" --command="
+            sudo install -o root -g root -m 0644 ~/docker-compose.yml.new ${DEPLOY_BASE_DIR}/docker-compose.yml &&
+            sudo install -o root -g root -m 0755 ~/remote-deploy.sh.new ${DEPLOY_BASE_DIR}/remote-deploy.sh &&
+            rm -f ~/docker-compose.yml.new ~/remote-deploy.sh.new
+          "
+
+      # The core of this job. Not `set -e`: a failed deploy is an
+      # expected, handled outcome here (triggers the rollback branch
+      # below), not a script bug — using the exit code explicitly is
+      # clearer than trying to make `set -e` cooperate with that.
+      #
+      # remote-deploy.sh's own stdout/stderr streams straight into this
+      # step's log via `gcloud compute ssh --command` (nothing redirected
+      # or swallowed) — that's what satisfies "capture the remote
+      # script's output in the workflow logs".
+      - name: Deploy (with automatic rollback on healthcheck failure)
+        id: deploy
+        env:
+          NEW_TAG: ${{ steps.sha.outputs.short }}
+        run: |
+          set -uo pipefail
+
+          ssh_run() {
+            gcloud compute ssh "${{ vars.GCE_VM_NAME }}" \
+              --zone="${{ vars.GCE_VM_ZONE }}" --project="${{ vars.GCP_PROJECT_ID }}" \
+              --tunnel-through-iap --quiet --command="$1"
+          }
+
+          echo "::group::Deploying ${NEW_TAG}"
+          ssh_run "${DEPLOY_BASE_DIR}/remote-deploy.sh ${NEW_TAG}"
+          DEPLOY_STATUS=$?
+          echo "::endgroup::"
+
+          if [[ "${DEPLOY_STATUS}" -eq 0 ]]; then
+            echo "Deploy of ${NEW_TAG} succeeded."
+            exit 0
+          fi
+
+          echo "::error::Deploy of ${NEW_TAG} failed (remote-deploy.sh exited ${DEPLOY_STATUS}) — attempting automatic rollback"
+
+          PREV_TAG="$(ssh_run "cat ${DEPLOY_BASE_DIR}/.last-good-tag 2>/dev/null || true" | tr -d '[:space:]')"
+
+          if [[ -z "${PREV_TAG}" ]]; then
+            echo "::error::No .last-good-tag recorded on the VM (this may be the first-ever deploy) — nothing to roll back to. VM is left on the failed ${NEW_TAG} deploy; investigate manually."
+            exit 1
+          fi
+
+          echo "::group::Rolling back to ${PREV_TAG}"
+          ssh_run "${DEPLOY_BASE_DIR}/remote-deploy.sh ${PREV_TAG}"
+          ROLLBACK_STATUS=$?
+          echo "::endgroup::"
+
+          if [[ "${ROLLBACK_STATUS}" -eq 0 ]]; then
+            echo "::error::Deploy of ${NEW_TAG} failed; automatically rolled back to previous known-good tag ${PREV_TAG} successfully. Failing this workflow so the bad deploy is still visible."
+          else
+            echo "::error::Deploy of ${NEW_TAG} failed AND rollback to ${PREV_TAG} also failed (exit ${ROLLBACK_STATUS}) — VM may be in a broken state, investigate manually."
+          fi
+          # Always non-zero past this point: per this task's own
+          # requirement, a failed deploy fails the workflow regardless of
+          # whether the automatic rollback itself succeeded.
+          exit 1
+
+      # Runs only if the step above exited 0 (default Actions behavior —
+      # a failed step skips subsequent steps unless they opt into
+      # `if: always()`, which this deliberately does not).
+      - name: Get deployment approver
+        id: approver
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APPROVER="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/approvals" --jq '.[0].user.login // empty' 2>/dev/null || true)"
+          if [[ -z "${APPROVER}" ]]; then
+            # Falls back to whoever triggered the underlying CI run if the
+            # approvals API returns nothing (e.g. the environment's
+            # required-reviewers rule was reconfigured mid-flight) —
+            # still a reasonable "who's responsible for this" answer.
+            APPROVER="${{ github.triggering_actor }}"
+          fi
+          echo "login=${APPROVER}" >> "$GITHUB_OUTPUT"
+
+      - name: Write deploy summary
+        if: success()
+        env:
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+          COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
+          COMMIT_URL: ${{ github.event.workflow_run.head_commit.url }}
+          TAG: ${{ steps.sha.outputs.short }}
+          APPROVER: ${{ steps.approver.outputs.login }}
+        run: |
+          # COMMIT_MESSAGE can be multi-line and contain `|` — passed via
+          # env (not interpolated straight into this script) specifically
+          # so it can't break the shell here, then sanitized for a
+          # markdown table cell (first line only, pipes escaped).
+          COMMIT_SUBJECT="$(printf '%s' "${COMMIT_MESSAGE}" | head -n1 | sed 's/|/\\|/g')"
+          {
+            echo "## 🚀 Deployed to production"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | [\`${COMMIT_SHA:0:7}\`](${COMMIT_URL}) — ${COMMIT_SUBJECT} |"
+            echo "| Image tag | \`${TAG}\` |"
+            echo "| Time (UTC) | $(date -u +'%Y-%m-%d %H:%M:%S') |"
+            echo "| Approved by | @${APPROVER} |"
+            echo "| VM | \`${{ vars.GCE_VM_NAME }}\` (\`${{ vars.GCE_VM_ZONE }}\`) |"
+          } >> "$GITHUB_STEP_SUMMARY"
