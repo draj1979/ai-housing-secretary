@@ -305,6 +305,84 @@ the updated source; `postgres`/`redis`/`nginx` are unaffected (pulled
 images, not built) unless their own version pin in `docker-compose.yml`
 changed.
 
+## CI/CD Auth: how GitHub Actions deploys without a service account key
+
+`scripts/gcp/setup-cicd.sh` provisions everything GitHub Actions needs to
+build/push images and deploy to this VM — an Artifact Registry repo, a
+dedicated `github-deployer@<project>.iam` service account, and a Workload
+Identity Federation (WIF) pool/provider — **without ever creating or
+downloading a GCP service account JSON key**. (The GitHub Actions workflow
+itself is a later phase; this section documents the auth plumbing it will
+use.)
+
+### Why no key file
+
+A downloaded SA key is a long-lived credential: if a GitHub secret ever
+leaks (a misconfigured workflow, a compromised Action, a fork's PR log),
+whoever has it can use it from anywhere, indefinitely, until someone
+notices and manually revokes it. Workload Identity Federation removes that
+risk structurally rather than relying on rotation discipline:
+
+- GitHub's OIDC token issuer (`token.actions.githubusercontent.com`)
+  signs a short-lived token identifying the exact repo, branch, and run.
+- GCP's WIF provider trusts that issuer and, per the token's claims,
+  lets the calling workflow **exchange** it for short-lived GCP
+  credentials — no persistent secret changes hands.
+- The exchange is restricted twice over: the provider's
+  `--attribute-condition` only accepts tokens from this repo at all, and
+  the deploy service account's `roles/iam.workloadIdentityUser` binding
+  only accepts tokens whose `sub` claim is exactly
+  `repo:<org>/ai-housing-secretary:ref:refs/heads/main` (or
+  `STAGING_BRANCH`, if configured) — so a workflow run on any other
+  branch, or from a fork's pull request, cannot impersonate the deploy
+  identity at all, not even with a leaked repo secret.
+- Credentials obtained this way expire in about an hour and are scoped to
+  exactly the roles below — nothing to revoke after the fact because
+  there's nothing long-lived to revoke.
+
+### What the deploy service account can do (and can't)
+
+`github-deployer@<project>.iam.gserviceaccount.com` holds exactly two
+grants, both resource-scoped rather than project-wide:
+
+| Role                                                         | Scope                                                 | Purpose                                                                                                                           |
+| ------------------------------------------------------------ | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `roles/artifactregistry.writer`                              | The one `ai-housing-secretary` Artifact Registry repo | Push built `gateway`/`worker`/`broadcast-worker` images                                                                           |
+| `roles/compute.osLogin` + `roles/iap.tunnelResourceAccessor` | The one deploy VM instance                            | SSH in via an IAP tunnel (no open port 22 — see `scripts/provision-gcp.sh`'s firewall note) to run `docker compose pull && up -d` |
+
+It cannot read Secret Manager, touch other Compute instances, modify IAM,
+or do anything outside those two resources. `scripts/gcp/setup-cicd.sh`
+has a `DEPLOY_VM_ACCESS_MODE=instance-admin` escape hatch (broader:
+`roles/compute.instanceAdmin.v1`, still instance-scoped) for workflows
+that need to stop/reset the VM as part of a deploy — off by default.
+
+### Running it
+
+```bash
+export PROJECT_ID=your-gcp-project
+export GITHUB_REPO=your-org/ai-housing-secretary   # defaults to draj1979/ai-housing-secretary
+./scripts/gcp/setup-cicd.sh
+```
+
+Requires the deploy VM to already exist (`scripts/provision-gcp.sh` run
+first) — IAM bindings above are scoped to that specific instance. Safe to
+re-run: every resource is describe-before-create and every IAM binding is
+additive, so re-running after setting `STAGING_BRANCH` (to allow deploys
+from `develop`, say) only adds the new binding.
+
+It prints, at the end, the six values to add as GitHub Actions repo
+secrets/variables — `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT`,
+`GCP_PROJECT_ID`, `ARTIFACT_REGISTRY_REGION`, `GCE_VM_NAME`,
+`GCE_VM_ZONE` — which the (not-yet-written) CI workflow will consume via
+[`google-github-actions/auth`](https://github.com/google-github-actions/auth):
+
+```yaml
+- uses: google-github-actions/auth@v2
+  with:
+    workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+    service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+```
+
 ## Vector store: PGVector (default) vs ChromaDB
 
 Default (`VECTOR_DB_PROVIDER=pgvector` in `.env`) needs nothing extra — the
