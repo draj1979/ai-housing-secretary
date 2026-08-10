@@ -24,16 +24,28 @@
 #      rollback is visible rather than silently swallowed.
 #
 # Expects DEPLOY_BASE_DIR (default /opt/ai-housing-secretary — see
-# scripts/provision-gcp.sh, which creates it) to already contain
-# docker-compose.yml and .env — CI delivers/refreshes docker-compose.yml
-# on every deploy (scp, alongside this script); .env is set up once by
-# following docs/deployment.md's "Clone the repo and configure secrets"
-# step (SECRETS_SOURCE=gcp — the app containers resolve real secret
-# values from Secret Manager themselves at boot, via this VM's own
-# attached service account; nothing secret is ever written into .env by
-# this script). What *does* change per deploy is IMAGE_TAG (e.g. the git
-# SHA just built) — pass it as the first argument (what CI does) or as an
-# env var; neither is persisted back into .env.
+# scripts/provision-gcp.sh, which creates it) to already contain:
+#   DEPLOY_BASE_DIR/.env                       (set up once, see below)
+#   DEPLOY_BASE_DIR/docker/docker-compose.yml  (CI delivers/refreshes this)
+#   DEPLOY_BASE_DIR/docker/nginx.conf.template (ditto)
+# The docker/ nesting is deliberate, not incidental: docker-compose.yml's
+# own `env_file: ../.env` (matching this repo's local-dev layout,
+# docker/docker-compose.yml next to root .env) only resolves correctly if
+# the compose file is one directory *below* wherever .env actually is —
+# get this wrong (e.g. dropping docker-compose.yml straight into
+# DEPLOY_BASE_DIR) and every container silently gets no env_file config
+# at all, or `docker compose` fails outright looking for .env one level
+# too high. CI's sync step (.github/workflows/cd.yml) preserves this
+# nesting; do the same if you ever place these files by hand.
+#
+# .env itself is set up once by following docs/deployment.md's "Clone the
+# repo and configure secrets" step (SECRETS_SOURCE=gcp — the app
+# containers resolve real secret values from Secret Manager themselves at
+# boot, via this VM's own attached service account; nothing secret is
+# ever written into .env by this script). What *does* change per deploy
+# is IMAGE_TAG (e.g. the git SHA just built) — pass it as the first
+# argument (what CI does) or as an env var; neither is persisted back
+# into .env.
 #
 # On a successful deploy (healthcheck passed), IMAGE_TAG is recorded to
 # LAST_GOOD_TAG_FILE (default DEPLOY_BASE_DIR/.last-good-tag) — this is
@@ -45,7 +57,10 @@
 set -euo pipefail
 
 DEPLOY_BASE_DIR="${DEPLOY_BASE_DIR:-/opt/ai-housing-secretary}"
-COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
+# Relative to DEPLOY_BASE_DIR (require_files below `cd`s there first) —
+# see this script's header comment for why "docker/" is load-bearing, not
+# cosmetic.
+COMPOSE_FILE="${COMPOSE_FILE:-docker/docker-compose.yml}"
 ENV_FILE="${ENV_FILE:-.env}"
 LAST_GOOD_TAG_FILE="${LAST_GOOD_TAG_FILE:-${DEPLOY_BASE_DIR}/.last-good-tag}"
 
@@ -75,7 +90,7 @@ log() { echo "==> $*" >&2; }
 require_files() {
   cd "${DEPLOY_BASE_DIR}"
   if [[ ! -f "${COMPOSE_FILE}" ]]; then
-    echo "Missing ${DEPLOY_BASE_DIR}/${COMPOSE_FILE} — CI should scp docker/docker-compose.yml here before invoking this script." >&2
+    echo "Missing ${DEPLOY_BASE_DIR}/${COMPOSE_FILE} — CI should scp docker/docker-compose.yml (and docker/nginx.conf.template) into DEPLOY_BASE_DIR/docker/ before invoking this script." >&2
     exit 1
   fi
   if [[ ! -f "${ENV_FILE}" ]]; then
@@ -90,18 +105,40 @@ require_files() {
 # roles/compute.osAdminLogin, which makes the OS Login user a passwordless
 # `google-sudoers` member). Fails loudly rather than hanging on a sudo
 # password prompt CI could never answer.
+#
+# The sudo branch explicitly carries COMPOSE_PROJECT_NAME across the sudo
+# boundary (`env COMPOSE_PROJECT_NAME=...`) rather than relying on plain
+# `sudo docker ...` to inherit it — sudo resets the environment by
+# default (Debian's default `env_reset` sudoers policy), silently
+# dropping custom variables like this one, which would otherwise leave
+# every deploy invoked through this branch back on Compose's own
+# directory-name-derived default project name (see that variable's own
+# comment for why that's a real, previously-hit problem, not
+# theoretical).
 DOCKER_CMD=()
 resolve_docker_cmd() {
   if docker info >/dev/null 2>&1; then
     DOCKER_CMD=(docker)
   elif sudo -n docker info >/dev/null 2>&1; then
-    DOCKER_CMD=(sudo -n docker)
+    DOCKER_CMD=(sudo -n env "COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}" docker)
   else
     echo "Cannot run docker (not in the docker group, and passwordless sudo isn't available). See scripts/gcp/setup-cicd.sh's OS_LOGIN_ROLE comment." >&2
     exit 1
   fi
   log "Running docker as: ${DOCKER_CMD[*]}"
 }
+
+# COMPOSE_PROJECT_NAME pinned explicitly rather than left to Compose's
+# own default (the compose *file's* parent directory basename — i.e.
+# "docker", not "ai-housing-secretary", given the DEPLOY_BASE_DIR/docker/
+# nesting this script's header comment explains). Confirmed live: without
+# this, re-running against an unchanged DEPLOY_BASE_DIR layout still
+# produces a *different* project name than before that layout existed,
+# leaving the previous run's containers orphaned under the old project
+# name — holding the very host ports (5432/6379/8080/80/443) the new
+# project's containers then fail to bind, every single deploy.
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ai-housing-secretary}"
+export COMPOSE_PROJECT_NAME
 
 compose() {
   "${DOCKER_CMD[@]}" compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"

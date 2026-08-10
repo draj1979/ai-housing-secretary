@@ -21,7 +21,7 @@ import {
   createFieldEncryption,
   fieldEncryptionConfigFromEnv,
 } from '../src/security/fieldEncryption.js';
-import { loadEnv } from '../src/config/env.js';
+import { loadEnv, loadEnvAsync } from '../src/config/env.js';
 
 interface SeedResident {
   flatNumber: string;
@@ -163,6 +163,13 @@ async function seedComplaints(
 }
 
 async function main() {
+  // Real process entry point (HLD Sec 15) — resolves SECRETS_SOURCE=gcp
+  // secrets (notably FIELD_ENCRYPTION_KEY, which seedResidents() below
+  // needs via the bare loadEnv() call in fieldEncryptionConfigFromEnv)
+  // into process.env before getPostgresClient()/loadEnv() re-validate it
+  // themselves. See config/env.ts's loadEnvAsync doc comment — same fix
+  // as src/db/migrate.ts, same underlying bug.
+  await loadEnvAsync();
   const db = getPostgresClient();
 
   console.log('Seeding residents...');
