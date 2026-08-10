@@ -410,15 +410,22 @@ aes-256-cbc` → `gsutil cp`, 90-day retention.
   the workflow's own header comment for why it's split out), and a
   Docker build check (no push).
 - **CD** — [`.github/workflows/cd.yml`](.github/workflows/cd.yml) fires
-  via `workflow_run` once CI passes on `main`. Two jobs, one shared
-  approval: `build-and-push` builds and pushes `docker/Dockerfile` to
-  Artifact Registry (tags `latest` + short SHA); `deploy` then SSHes into
-  the VM (IAP tunnel, OS Login, no static keys) and runs
-  `scripts/gcp/remote-deploy.sh <short-sha>`, automatically rolling back
-  to the VM's recorded `.last-good-tag` — and still failing the workflow
-  either way — if the new deploy's healthcheck fails. Both via
-  `scripts/gcp/setup-cicd.sh`'s WIF auth (`docs/deployment.md`'s "CI/CD
-  Auth" section) — no service account key anywhere. Both jobs sit behind
-  a `production` GitHub Environment with a required reviewer (Section 2's
+  via `workflow_run` once CI passes, on two independent tracks: push to
+  `main` -> `build-and-push-production`/`deploy-production` -> `openclaw1`
+  (`production` GitHub Environment, required reviewer — Section 2's
   human-in-the-loop principle, applied to the deploy pipeline itself, not
-  just the app).
+  just the app); push to `develop` -> `build-and-push-staging`/
+  `deploy-staging` -> `ai-housing-secretary-staging` (`staging`
+  Environment, **no** required reviewer — that's the point, it's the
+  pre-approval verification step). Both tracks build/push via WIF
+  (`scripts/gcp/setup-cicd.sh`, `github-deployer@` bound to both
+  `refs/heads/main` and `refs/heads/develop`) then SSH into their VM (IAP
+  tunnel, OS Login, no static keys) and run
+  `scripts/gcp/remote-deploy.sh <tag>`, automatically rolling back to that
+  VM's own recorded `.last-good-tag` — and still failing the workflow
+  either way — if the new deploy's healthcheck fails. No service account
+  key anywhere, and — per `docs/deployment.md`'s "Secret flow" section —
+  no app secret (Gemini/WhatsApp/JWT/field-encryption) ever touches
+  GitHub either: `remote-deploy.sh`'s `refresh_secrets()` fetches those
+  from Secret Manager _on the VM itself_, using the VM's own service
+  account, never the CI identity's.

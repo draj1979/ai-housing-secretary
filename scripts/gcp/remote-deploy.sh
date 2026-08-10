@@ -7,13 +7,24 @@
 # docs/deployment.md's "CI/CD Auth" section) and invokes to actually roll
 # out a new deploy:
 #
-#   1. docker compose pull   — fetch the image scripts/gcp/setup-cicd.sh's
+#   1. Refresh app secrets — fetch the current value of every secret in
+#      SECRET_MAP (below) from GCP Secret Manager and write it into
+#      ENV_FILE, replacing whatever was there before. This is the one
+#      place secret *values* ever touch disk in this whole pipeline —
+#      GitHub Actions (.github/workflows/cd.yml) never sees them, only
+#      WIF_PROVIDER/WIF_SERVICE_ACCOUNT/GCP_PROJECT_ID/
+#      ARTIFACT_REGISTRY_REGION/GCE_VM_NAME/GCE_VM_ZONE, none of which
+#      are app secrets. Values are never echoed, printed, or otherwise
+#      logged anywhere in this function — see docs/deployment.md's
+#      "Secret flow" diagram for the full picture end to end.
+#   2. docker compose pull   — fetch the image scripts/gcp/setup-cicd.sh's
 #      Artifact Registry auth (configured on this VM by
 #      scripts/provision-gcp.sh's startup script) was pushed to.
-#   2. Run DB migrations against the already-running (or freshly started)
+#   3. Run DB migrations against the already-running (or freshly started)
 #      postgres.
-#   3. docker compose up -d  — (re)start every service on the new image.
-#   4. Poll the local healthcheck endpoint until it returns 200 or
+#   4. docker compose up -d  — (re)start every service on the new image,
+#      picking up step 1's freshly-written .env.
+#   5. Poll the local healthcheck endpoint until it returns 200 or
 #      HEALTH_TIMEOUT_SECONDS elapses — exits non-zero on timeout, which
 #      is CI's signal that the deploy failed and the workflow step should
 #      go red. This script itself does not roll back (it wouldn't know
@@ -38,14 +49,15 @@
 # too high. CI's sync step (.github/workflows/cd.yml) preserves this
 # nesting; do the same if you ever place these files by hand.
 #
-# .env itself is set up once by following docs/deployment.md's "Clone the
-# repo and configure secrets" step (SECRETS_SOURCE=gcp — the app
-# containers resolve real secret values from Secret Manager themselves at
-# boot, via this VM's own attached service account; nothing secret is
-# ever written into .env by this script). What *does* change per deploy
-# is IMAGE_TAG (e.g. the git SHA just built) — pass it as the first
-# argument (what CI does) or as an env var; neither is persisted back
-# into .env.
+# .env's non-secret config (DOMAIN, GCP_PROJECT_ID, ports, feature
+# flags, ...) is set up once by following docs/deployment.md's "Clone the
+# repo and configure secrets" step; its *secret* fields
+# (GEMINI_API_KEY/WHATSAPP_CLOUD_API_TOKEN/JWT_SECRET/
+# FIELD_ENCRYPTION_KEY) are overwritten by step 1 above on every single
+# deploy, so whatever placeholder value they start with doesn't matter.
+# What *does* change per deploy is IMAGE_TAG (e.g. the git SHA just
+# built) — pass it as the first argument (what CI does) or as an env
+# var; neither is persisted back into .env.
 #
 # On a successful deploy (healthcheck passed), IMAGE_TAG is recorded to
 # LAST_GOOD_TAG_FILE (default DEPLOY_BASE_DIR/.last-good-tag) — this is
@@ -94,7 +106,7 @@ require_files() {
     exit 1
   fi
   if [[ ! -f "${ENV_FILE}" ]]; then
-    echo "Missing ${DEPLOY_BASE_DIR}/${ENV_FILE} — run docs/deployment.md's \"Clone the repo and configure secrets\" step once on this VM first (SECRETS_SOURCE=gcp path recommended)." >&2
+    echo "Missing ${DEPLOY_BASE_DIR}/${ENV_FILE} — run docs/deployment.md's \"Clone the repo and configure secrets\" step once on this VM first (only the non-secret config needs to be right; refresh_secrets() below fills in the real secret values on every run)." >&2
     exit 1
   fi
 }
@@ -145,7 +157,90 @@ compose() {
 }
 
 # -----------------------------------------------------------------------------
-# 1. Pull the freshly-built image(s) — see docker-compose.yml's `image:`
+# 1. Refresh app secrets from Secret Manager into .env — the only place
+#    secret *values* exist outside Secret Manager itself in this whole
+#    pipeline (see docs/deployment.md's "Secret flow" section/diagram).
+#    GitHub Actions never holds these; it only ever authenticates via WIF
+#    and tells this VM which image tag to run.
+#
+#    ENV_KEY:secret-name pairs, mirroring config/secrets.ts's
+#    SECRET_TARGETS list minus DATABASE_URL — this repo's default deploy
+#    path is docker-compose's self-hosted Postgres (a fixed local
+#    connection string, not a real external credential; see .env's own
+#    DATABASE_URL comment), so DATABASE_URL isn't Secret-Manager-backed
+#    here. Add "DATABASE_URL:database-url" to SECRET_MAP too only if
+#    you've switched to Cloud SQL (PROVISION_CLOUD_SQL=true,
+#    scripts/provision-gcp.sh).
+# -----------------------------------------------------------------------------
+
+SECRET_MAP=(
+  "GEMINI_API_KEY:gemini-api-key"
+  "WHATSAPP_CLOUD_API_TOKEN:whatsapp-cloud-api-token"
+  "JWT_SECRET:jwt-secret"
+  "FIELD_ENCRYPTION_KEY:field-encryption-key"
+)
+
+# Writes ENV_FILE's contents to stdout via sudo when needed — the one
+# helper both refresh_secrets() (reading GCP_PROJECT_ID out of it) and
+# its own rewrite step share, since ENV_FILE is root-owned 0600 and the
+# non-root OS Login path can't `cat` it directly either.
+read_env_file() {
+  if [[ "${DOCKER_CMD[0]:-}" == "sudo" ]]; then
+    sudo -n cat "${ENV_FILE}"
+  else
+    cat "${ENV_FILE}"
+  fi
+}
+
+refresh_secrets() {
+  log "Refreshing ${#SECRET_MAP[@]} app secret(s) from Secret Manager into ${ENV_FILE} (values never logged)"
+
+  local project_id
+  project_id="$(read_env_file | grep -m1 '^GCP_PROJECT_ID=' | cut -d= -f2-)"
+  if [[ -z "${project_id}" ]]; then
+    echo "GCP_PROJECT_ID not set in ${DEPLOY_BASE_DIR}/${ENV_FILE} — cannot tell which project's Secret Manager to read from." >&2
+    exit 1
+  fi
+
+  # Rebuild ENV_FILE: every line NOT matching one of SECRET_MAP's keys
+  # passes through untouched; each matched key gets a freshly-fetched
+  # value appended once. Done via a temp file + atomic `install` rather
+  # than editing ENV_FILE in place, so a failed fetch partway through
+  # (network blip, a secret rotated to no versions) never leaves ENV_FILE
+  # half-written.
+  local tmp_env strip_pattern pair env_key secret_name value
+  tmp_env="$(mktemp)"
+  strip_pattern=""
+  for pair in "${SECRET_MAP[@]}"; do
+    env_key="${pair%%:*}"
+    strip_pattern+="${strip_pattern:+|}^${env_key}="
+  done
+  read_env_file | grep -vE "${strip_pattern}" >"${tmp_env}"
+
+  for pair in "${SECRET_MAP[@]}"; do
+    env_key="${pair%%:*}"
+    secret_name="${pair#*:}"
+    if ! value="$(gcloud secrets versions access latest --secret="${secret_name}" --project="${project_id}" 2>/dev/null)"; then
+      echo "Failed to fetch secret '${secret_name}' (for ${env_key}) from Secret Manager — check it has at least one version, and that this VM's own service account has roles/secretmanager.secretAccessor (scripts/provision-gcp.sh grants this by default). Aborting rather than deploying with a stale or missing value." >&2
+      rm -f "${tmp_env}"
+      exit 1
+    fi
+    # printf, not echo — a value that happens to start with '-' is never
+    # misread as a flag. Never printed anywhere else in this function.
+    printf '%s=%s\n' "${env_key}" "${value}" >>"${tmp_env}"
+  done
+
+  if [[ "${DOCKER_CMD[0]:-}" == "sudo" ]]; then
+    sudo -n install -o root -g root -m 0600 "${tmp_env}" "${ENV_FILE}"
+  else
+    install -m 0600 "${tmp_env}" "${ENV_FILE}"
+  fi
+  rm -f "${tmp_env}"
+  log "Secrets refreshed"
+}
+
+# -----------------------------------------------------------------------------
+# 2. Pull the freshly-built image(s) — see docker-compose.yml's `image:`
 #    fields; the three app services all share one image (one Dockerfile,
 #    CMD overridden per service).
 # -----------------------------------------------------------------------------
@@ -156,7 +251,7 @@ pull_images() {
 }
 
 # -----------------------------------------------------------------------------
-# 2. Migrations — postgres/redis must be up first (compose's own
+# 3. Migrations — postgres/redis must be up first (compose's own
 #    depends_on: condition: service_healthy handles ordering once
 #    `up -d` is told to include them), then run the migration once as a
 #    throwaway container so it doesn't matter whether `gateway` is
@@ -171,7 +266,7 @@ run_migrations() {
 }
 
 # -----------------------------------------------------------------------------
-# 3. Roll out — recreates any service whose image/config changed;
+# 4. Roll out — recreates any service whose image/config changed;
 #    services already on the new image/config are left untouched.
 # -----------------------------------------------------------------------------
 
@@ -181,7 +276,7 @@ roll_out() {
 }
 
 # -----------------------------------------------------------------------------
-# 4. Healthcheck gate — this is what makes the deploy step in CI actually
+# 5. Healthcheck gate — this is what makes the deploy step in CI actually
 #    fail on a bad rollout instead of reporting success just because
 #    `docker compose up -d` returned 0 (a container can start and still
 #    be crash-looping or failing its own internal readiness checks).
@@ -208,7 +303,7 @@ wait_for_healthy() {
 }
 
 # -----------------------------------------------------------------------------
-# 5. Record this as the last known-good tag — only reached if
+# 6. Record this as the last known-good tag — only reached if
 #    wait_for_healthy returned 0. .github/workflows/cd.yml's deploy job
 #    reads this file (a plain SSH `cat`, no special tooling) when a
 #    *later* deploy fails, to know what to roll back to. Uses the same
@@ -228,6 +323,7 @@ record_last_good_tag() {
 main() {
   require_files
   resolve_docker_cmd
+  refresh_secrets
   pull_images
   run_migrations
   roll_out

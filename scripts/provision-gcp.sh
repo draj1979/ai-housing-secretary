@@ -192,26 +192,35 @@ create_service_account() {
   fi
 
   log "Granting minimal IAM roles to ${sa_email}"
+  # --condition=None on every call below: once a project's IAM policy
+  # contains *any* conditioned binding (e.g. scripts/gcp/setup-cicd.sh's
+  # instance-scoped IAP/OS-Login grants), gcloud refuses to add a further
+  # *unconditioned* binding without this flag being explicit — "Adding a
+  # binding without specifying a condition to a policy containing
+  # conditions is prohibited in non-interactive mode." Confirmed live
+  # (re-running this script against a project that had already run
+  # setup-cicd.sh). Harmless/required either way: a no-op on a policy
+  # with no conditions yet, load-bearing once one exists.
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${sa_email}" \
-    --role="roles/secretmanager.secretAccessor" --quiet >/dev/null
+    --role="roles/secretmanager.secretAccessor" --condition=None --quiet >/dev/null
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${sa_email}" \
-    --role="roles/logging.logWriter" --quiet >/dev/null
+    --role="roles/logging.logWriter" --condition=None --quiet >/dev/null
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${sa_email}" \
-    --role="roles/monitoring.metricWriter" --quiet >/dev/null
+    --role="roles/monitoring.metricWriter" --condition=None --quiet >/dev/null
   if [[ "${PROVISION_CLOUD_SQL}" == "true" ]]; then
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
       --member="serviceAccount:${sa_email}" \
-      --role="roles/cloudsql.client" --quiet >/dev/null
+      --role="roles/cloudsql.client" --condition=None --quiet >/dev/null
   fi
   # Bucket-level (not project-level) access — the VM can read/write these
   # two buckets specifically, not every bucket in the project.
   gcloud storage buckets add-iam-policy-binding "gs://${STORAGE_BUCKET_DOCS}" \
-    --member="serviceAccount:${sa_email}" --role="roles/storage.objectAdmin" --quiet >/dev/null 2>&1 || true
+    --member="serviceAccount:${sa_email}" --role="roles/storage.objectAdmin" --condition=None --quiet >/dev/null 2>&1 || true
   gcloud storage buckets add-iam-policy-binding "gs://${STORAGE_BUCKET_BACKUPS}" \
-    --member="serviceAccount:${sa_email}" --role="roles/storage.objectAdmin" --quiet >/dev/null 2>&1 || true
+    --member="serviceAccount:${sa_email}" --role="roles/storage.objectAdmin" --condition=None --quiet >/dev/null 2>&1 || true
 }
 
 # -----------------------------------------------------------------------------

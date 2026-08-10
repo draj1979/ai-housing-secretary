@@ -1,66 +1,75 @@
 # CD — builds and pushes the Docker image to Artifact Registry after CI
-# passes on main.
+# passes, then rolls it out. Two parallel tracks, same file:
+#
+#   push to main    -> build-and-push-production / deploy-production
+#                      -> openclaw1 (environment: production, required
+#                         reviewer)
+#   push to develop -> build-and-push-staging / deploy-staging
+#                      -> ai-housing-secretary-staging (environment:
+#                         staging, no required reviewer — this IS the
+#                         "verify before production approval" step)
 #
 # Triggered by `workflow_run` watching the "CI" workflow (.github/workflows/ci.yml)
-# rather than its own `push: branches: [main]`, on purpose: this reuses
-# CI's already-completed lint/typecheck/test/guardrails/docker-build
-# result instead of re-running those checks a second time (cheaper, and
-# there's only one place — ci.yml — that defines what "passing" means).
-# `branches: [main]` on the trigger further narrows this to CI runs whose
-# head branch was main (i.e. the push-to-main run, not a PR run against
-# some feature branch) — see the job-level `if:` below for the other half
-# of this gate (a *completed* run isn't necessarily a *successful* one).
+# rather than its own `push:` trigger, on purpose: this reuses CI's
+# already-completed lint/typecheck/test/guardrails/docker-build result
+# instead of re-running those checks a second time (cheaper, and there's
+# only one place — ci.yml — that defines what "passing" means).
+# `branches: [main, develop]` on the trigger narrows this to CI runs on
+# either of those two branches; each job's own `if:` then checks
+# `github.event.workflow_run.head_branch` to pick exactly one track — see
+# each job for its own gate (a *completed* run isn't necessarily a
+# *successful* one either, which the same `if:` also checks).
 #
 # No GCP service account key anywhere in this file — auth is Workload
 # Identity Federation via google-github-actions/auth, exchanging GitHub's
 # own OIDC token for short-lived GCP credentials scoped to exactly this
-# run. See scripts/gcp/setup-cicd.sh (which provisions the WIF pool/
-# provider/deploy service account this depends on) and
-# docs/deployment.md's "CI/CD Auth" section for the full design.
+# run. github-deployer@ is bound to both refs/heads/main and
+# refs/heads/develop (scripts/gcp/setup-cicd.sh's STAGING_BRANCH) — see
+# that script and docs/deployment.md's "CI/CD Auth" section for the full
+# design.
 #
-# Two jobs, both gated behind a GitHub Environment ("production") with
-# required reviewers — matching CLAUDE.md Sec 2's human-in-the-loop
-# principle, the same "nothing ships without a human" rule the app itself
-# enforces for broadcasts. GitHub shares one approval across every job in
-# a run that references the same environment, so a reviewer approves
-# once and both jobs below proceed:
+# GCE_VM_NAME/GCE_VM_ZONE are deliberately *not* repo-level variables —
+# they're set per-Environment (Settings -> Environments -> production /
+# staging -> Variables), so the exact same `${{ vars.GCE_VM_NAME }}`
+# expression below resolves to openclaw1 in the production jobs and
+# ai-housing-secretary-staging in the staging jobs, with zero
+# duplication of step logic between the two tracks. GCP_PROJECT_ID/
+# ARTIFACT_REGISTRY_REGION stay repo-level — same project/region either
+# way.
 #
-#   1. build-and-push — builds docker/Dockerfile, tags `latest` + the
-#      short git SHA of the exact commit CI tested, pushes both to
-#      Artifact Registry.
-#   2. deploy — SSHes into the VM (IAP tunnel, OS Login, no static keys —
-#      scripts/gcp/setup-cicd.sh's deploy service account) and runs
-#      scripts/gcp/remote-deploy.sh with the new tag. If remote-deploy.sh's
-#      own healthcheck fails, this job reads the VM's `.last-good-tag`
-#      file and re-invokes remote-deploy.sh with *that* tag as an
-#      automatic rollback — then still fails the workflow regardless of
-#      whether the rollback itself succeeded, so a bad deploy is always
-#      visible, never silently absorbed. See that job's own comments for
-#      the full sequence.
+# What each track's two jobs do (identical shape on both sides):
+#   1. build-and-push-* — builds docker/Dockerfile, tags the short git
+#      SHA of the exact commit CI tested (prefixed `staging-` on the
+#      staging track, to keep it visually distinct from production tags
+#      in the shared Artifact Registry repo; production also tags
+#      `latest`, staging does not — docker-compose.yml's own `latest`
+#      default is meant to mean "production", not "whatever's newest
+#      anywhere"), pushes to Artifact Registry.
+#   2. deploy-* — SSHes into the target VM (IAP tunnel, OS Login, no
+#      static keys) and runs scripts/gcp/remote-deploy.sh with the new
+#      tag. If remote-deploy.sh's own healthcheck fails, reads the VM's
+#      `.last-good-tag` file and re-invokes remote-deploy.sh with *that*
+#      tag as an automatic rollback — then still fails the workflow
+#      regardless of whether the rollback itself succeeded, so a bad
+#      deploy is always visible, never silently absorbed.
 #
 # One-time manual setup this file cannot do for you: creating the
-# "production" Environment itself and adding required reviewers is a
-# repo-settings action (Settings -> Environments -> New environment ->
-# "production" -> Required reviewers), not something declarable in this
-# YAML — see docs/deployment.md's "CI/CD Auth" section for the exact
-# steps (or the `gh api` equivalent) if it isn't already configured. The
-# deploy job also needs `gcloud compute ssh --tunnel-through-iap` to
-# actually reach the VM — scripts/provision-gcp.sh's printed setup notes
-# cover enabling IAP TCP forwarding / the allow-ssh-iap firewall rule if
-# that's not already in place.
+# "production"/"staging" Environments themselves (Settings ->
+# Environments), production's required reviewer, and each Environment's
+# GCE_VM_NAME/GCE_VM_ZONE variables — see docs/deployment.md's "CI/CD
+# Auth" section for the exact steps (or the `gh api` equivalent) if
+# either isn't already configured. Every job also needs
+# `gcloud compute ssh --tunnel-through-iap` to actually reach its VM —
+# scripts/provision-gcp.sh's printed setup notes cover enabling IAP TCP
+# forwarding / the allow-ssh-iap firewall rule if that's not already in
+# place.
 name: CD
 
 on:
   workflow_run:
     workflows: ['CI']
     types: [completed]
-    branches: [main]
-
-# Never cancel an in-progress deploy for a newer push — queue instead, so
-# two overlapping runs can't push half-finished/out-of-order image tags.
-concurrency:
-  group: cd-production
-  cancel-in-progress: false
+    branches: [main, develop]
 
 permissions:
   contents: read
@@ -70,12 +79,28 @@ permissions:
   id-token: write
 
 jobs:
-  build-and-push:
-    name: Build & Push Image
+  # ===========================================================================
+  # Production track (push to main)
+  # ===========================================================================
+
+  build-and-push-production:
+    name: 'Build & Push Image (production)'
     runs-on: ubuntu-latest
-    # workflow_run always fires on completion, success or failure — this
-    # is what actually stops a failed CI run from triggering a deploy.
-    if: github.event.workflow_run.conclusion == 'success'
+    # workflow_run always fires on completion, success or failure, for
+    # either watched branch — both halves of this check matter: only a
+    # *successful* CI run, and only one that ran on *main*.
+    if: |
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+
+    # Never cancel an in-progress production deploy for a newer push —
+    # queue instead, so two overlapping runs can't push half-finished/
+    # out-of-order image tags. Separate concurrency group from staging's
+    # below, so a staging deploy never waits on a production one or vice
+    # versa — the two targets are independent.
+    concurrency:
+      group: cd-production
+      cancel-in-progress: false
 
     # Protected GitHub Environment: this job does not start at all until
     # a required reviewer approves it in the Environments UI (Settings ->
@@ -154,17 +179,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ---------------------------------------------------------------------------
-  # Deploy — SSHes into the deploy VM and runs scripts/gcp/remote-deploy.sh
-  # with the tag build-and-push just pushed. See this workflow's own
-  # header comment for the shared-approval design (one reviewer click
-  # covers both jobs) and scripts/gcp/remote-deploy.sh's header for what
-  # it does once invoked (pull -> migrate -> up -d -> healthcheck ->
-  # record .last-good-tag).
-  # ---------------------------------------------------------------------------
-  deploy:
-    name: Deploy to VM
-    needs: build-and-push
+  deploy-production:
+    name: Deploy to VM (production)
+    needs: build-and-push-production
     runs-on: ubuntu-latest
     environment:
       name: production
@@ -178,9 +195,9 @@ jobs:
       actions: read
     env:
       # Must match scripts/provision-gcp.sh's DEPLOY_BASE_DIR default —
-      # not one of scripts/gcp/setup-cicd.sh's six printed repo
-      # variables, so it isn't parameterized via `vars.*` here; update
-      # this literal if that default is ever changed at provisioning time.
+      # not one of scripts/gcp/setup-cicd.sh's printed repo variables, so
+      # it isn't parameterized via `vars.*` here; update this literal if
+      # that default is ever changed at provisioning time.
       DEPLOY_BASE_DIR: /opt/ai-housing-secretary
 
     steps:
@@ -263,7 +280,9 @@ jobs:
       # remote-deploy.sh's own stdout/stderr streams straight into this
       # step's log via `gcloud compute ssh --command` (nothing redirected
       # or swallowed) — that's what satisfies "capture the remote
-      # script's output in the workflow logs".
+      # script's output in the workflow logs". Its own secret-refresh
+      # step never prints a value either — see that script's own
+      # comments and docs/deployment.md's "Secret flow" section.
       - name: Deploy (with automatic rollback on healthcheck failure)
         id: deploy
         env:
@@ -353,5 +372,201 @@ jobs:
             echo "| Image tag | \`${TAG}\` |"
             echo "| Time (UTC) | $(date -u +'%Y-%m-%d %H:%M:%S') |"
             echo "| Approved by | @${APPROVER} |"
+            echo "| VM | \`${{ vars.GCE_VM_NAME }}\` (\`${{ vars.GCE_VM_ZONE }}\`) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # Staging track (push to develop) — same shape as the production jobs
+  # above, deliberately kept structurally identical rather than factored
+  # into a reusable workflow, so a diff between the two tracks is a diff
+  # between two readable job blocks, not an indirection through inputs.
+  # Key differences, called out where they occur: no required-reviewer
+  # gate (this track *is* the pre-approval verification step), tags
+  # prefixed `staging-` and no floating `latest`, targets the
+  # `staging` Environment's own GCE_VM_NAME/GCE_VM_ZONE.
+  # ===========================================================================
+
+  build-and-push-staging:
+    name: 'Build & Push Image (staging)'
+    runs-on: ubuntu-latest
+    if: |
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'develop'
+
+    concurrency:
+      group: cd-staging
+      cancel-in-progress: false
+
+    # No required reviewers on "staging" (Settings -> Environments ->
+    # staging) — unlike production, this runs unattended the moment CI
+    # passes on develop. That's the point: staging is where a change
+    # becomes checkable *before* someone has to decide whether to
+    # approve it for production.
+    environment:
+      name: staging
+
+    steps:
+      - name: Checkout (commit CI actually tested)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Compute short SHA
+        id: sha
+        run: |
+          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Log in to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # `staging-<sha>` only, deliberately no `latest` push — see this
+      # section's own header comment for why.
+      - name: 'Build and push (tag: staging-<short SHA>)'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ vars.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO_NAME || 'ai-housing-secretary' }}/app:staging-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to VM (staging)
+    needs: build-and-push-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    env:
+      DEPLOY_BASE_DIR: /opt/ai-housing-secretary
+
+    steps:
+      - name: Checkout (commit CI actually tested)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Compute short SHA
+        id: sha
+        run: |
+          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sync docker-compose.yml + nginx.conf.template + remote-deploy.sh to the VM
+        run: |
+          set -euo pipefail
+          COMMON_FLAGS=(--zone="${{ vars.GCE_VM_ZONE }}" --project="${{ vars.GCP_PROJECT_ID }}" --tunnel-through-iap --quiet)
+
+          gcloud compute scp "${COMMON_FLAGS[@]}" \
+            docker/docker-compose.yml "${{ vars.GCE_VM_NAME }}:~/docker-compose.yml.new"
+          gcloud compute scp "${COMMON_FLAGS[@]}" \
+            docker/nginx.conf.template "${{ vars.GCE_VM_NAME }}:~/nginx.conf.template.new"
+          gcloud compute scp "${COMMON_FLAGS[@]}" \
+            scripts/gcp/remote-deploy.sh "${{ vars.GCE_VM_NAME }}:~/remote-deploy.sh.new"
+
+          gcloud compute ssh "${{ vars.GCE_VM_NAME }}" "${COMMON_FLAGS[@]}" --command="
+            sudo install -D -o root -g root -m 0644 ~/docker-compose.yml.new ${DEPLOY_BASE_DIR}/docker/docker-compose.yml &&
+            sudo install -D -o root -g root -m 0644 ~/nginx.conf.template.new ${DEPLOY_BASE_DIR}/docker/nginx.conf.template &&
+            sudo install -o root -g root -m 0755 ~/remote-deploy.sh.new ${DEPLOY_BASE_DIR}/remote-deploy.sh &&
+            rm -f ~/docker-compose.yml.new ~/nginx.conf.template.new ~/remote-deploy.sh.new
+          "
+
+      # Same automatic-rollback design as deploy-production — see that
+      # job's identical step for the full commentary. IMAGE_TAG here is
+      # the `staging-<sha>` tag build-and-push-staging just pushed, and
+      # this VM's own .last-good-tag is entirely separate from
+      # production's (different VM, different file).
+      - name: Deploy (with automatic rollback on healthcheck failure)
+        id: deploy
+        env:
+          NEW_TAG: staging-${{ steps.sha.outputs.short }}
+        run: |
+          set -uo pipefail
+
+          ssh_run() {
+            gcloud compute ssh "${{ vars.GCE_VM_NAME }}" \
+              --zone="${{ vars.GCE_VM_ZONE }}" --project="${{ vars.GCP_PROJECT_ID }}" \
+              --tunnel-through-iap --quiet --command="$1"
+          }
+
+          echo "::group::Deploying ${NEW_TAG}"
+          ssh_run "${DEPLOY_BASE_DIR}/remote-deploy.sh ${NEW_TAG}"
+          DEPLOY_STATUS=$?
+          echo "::endgroup::"
+
+          if [[ "${DEPLOY_STATUS}" -eq 0 ]]; then
+            echo "Deploy of ${NEW_TAG} succeeded."
+            exit 0
+          fi
+
+          echo "::error::Deploy of ${NEW_TAG} failed (remote-deploy.sh exited ${DEPLOY_STATUS}) — attempting automatic rollback"
+
+          PREV_TAG="$(ssh_run "cat ${DEPLOY_BASE_DIR}/.last-good-tag 2>/dev/null || true" | tr -d '[:space:]')"
+
+          if [[ -z "${PREV_TAG}" ]]; then
+            echo "::error::No .last-good-tag recorded on the VM (this may be the first-ever deploy) — nothing to roll back to. VM is left on the failed ${NEW_TAG} deploy; investigate manually."
+            exit 1
+          fi
+
+          echo "::group::Rolling back to ${PREV_TAG}"
+          ssh_run "${DEPLOY_BASE_DIR}/remote-deploy.sh ${PREV_TAG}"
+          ROLLBACK_STATUS=$?
+          echo "::endgroup::"
+
+          if [[ "${ROLLBACK_STATUS}" -eq 0 ]]; then
+            echo "::error::Deploy of ${NEW_TAG} failed; automatically rolled back to previous known-good tag ${PREV_TAG} successfully. Failing this workflow so the bad deploy is still visible."
+          else
+            echo "::error::Deploy of ${NEW_TAG} failed AND rollback to ${PREV_TAG} also failed (exit ${ROLLBACK_STATUS}) — VM may be in a broken state, investigate manually."
+          fi
+          exit 1
+
+      - name: Write deploy summary
+        if: success()
+        env:
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+          COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
+          COMMIT_URL: ${{ github.event.workflow_run.head_commit.url }}
+          TAG: staging-${{ steps.sha.outputs.short }}
+        run: |
+          COMMIT_SUBJECT="$(printf '%s' "${COMMIT_MESSAGE}" | head -n1 | sed 's/|/\\|/g')"
+          {
+            echo "## 🧪 Deployed to staging"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | [\`${COMMIT_SHA:0:7}\`](${COMMIT_URL}) — ${COMMIT_SUBJECT} |"
+            echo "| Image tag | \`${TAG}\` |"
+            echo "| Time (UTC) | $(date -u +'%Y-%m-%d %H:%M:%S') |"
             echo "| VM | \`${{ vars.GCE_VM_NAME }}\` (\`${{ vars.GCE_VM_ZONE }}\`) |"
           } >> "$GITHUB_STEP_SUMMARY"

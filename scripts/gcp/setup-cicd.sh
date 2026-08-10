@@ -203,11 +203,16 @@ create_deploy_service_account() {
   fi
 
   log "Granting roles/artifactregistry.writer on ${AR_REPO_NAME} (repo-scoped, not project-wide)"
+  # --condition=None: required once the project's IAM policy contains any
+  # conditioned binding (see create_deploy_service_account()'s instance-
+  # scoped grants below) — see scripts/provision-gcp.sh's own comment on
+  # this same flag for the full explanation, confirmed live there.
   gcloud artifacts repositories add-iam-policy-binding "${AR_REPO_NAME}" \
     --project="${PROJECT_ID}" \
     --location="${REGION}" \
     --member="serviceAccount:${sa_email}" \
     --role="roles/artifactregistry.writer" \
+    --condition=None \
     --quiet >/dev/null
 
   # roles/iap.tunnelResourceAccessor is NOT one of the roles GCP allows
@@ -245,11 +250,16 @@ create_deploy_service_account() {
       ;;
     instance-admin)
       log "Granting roles/compute.instanceAdmin.v1 on ${GCE_VM_NAME} (instance-scoped)"
+      # This one *is* natively instance-level-grantable (unlike the two
+      # above), so no IAM Condition is needed for scoping — but
+      # --condition=None is still required once the project's policy has
+      # any conditioned binding at all, same reasoning as elsewhere here.
       gcloud compute instances add-iam-policy-binding "${GCE_VM_NAME}" \
         --project="${PROJECT_ID}" \
         --zone="${GCE_VM_ZONE}" \
         --member="serviceAccount:${sa_email}" \
         --role="roles/compute.instanceAdmin.v1" \
+        --condition=None \
         --quiet >/dev/null
       ;;
     *)

@@ -432,45 +432,54 @@ Secrets and variables -> Actions, matching that split:
 ### `.github/workflows/cd.yml` — build & push after CI passes
 
 Triggered by `workflow_run` watching `.github/workflows/ci.yml`'s "CI"
-workflow (not its own `push: branches: [main]`) so it reuses CI's
-already-completed lint/typecheck/test/guardrails/docker-build result
-instead of re-running those checks a second time — `ci.yml` alone still
-defines what "passing" means. The job itself guards against a
-_completed-but-failed_ CI run with `if:
-github.event.workflow_run.conclusion == 'success'`.
+workflow (not its own `push:` trigger) so it reuses CI's already-completed
+lint/typecheck/test/guardrails/docker-build result instead of re-running
+those checks a second time — `ci.yml` alone still defines what "passing"
+means. Two independent tracks in the same file, picked by
+`github.event.workflow_run.head_branch`:
 
-It authenticates via the same WIF plumbing above (`token_format:
+|                | Trigger branch | Jobs                                             | Environment                      | Target VM                      |
+| -------------- | -------------- | ------------------------------------------------ | -------------------------------- | ------------------------------ |
+| **Production** | `main`         | `build-and-push-production`, `deploy-production` | `production` — required reviewer | `openclaw1`                    |
+| **Staging**    | `develop`      | `build-and-push-staging`, `deploy-staging`       | `staging` — no required reviewer | `ai-housing-secretary-staging` |
+
+Each `build-and-push-*` job authenticates via WIF (`token_format:
 access_token`, fed straight into `docker/login-action` — no `gcloud` CLI
-needed on the runner), then builds and pushes `docker/Dockerfile` to
-Artifact Registry tagged both `latest` and the short git SHA of the exact
-commit CI tested (`github.event.workflow_run.head_sha`, not whatever
-`main` happens to point at when the job actually starts — see the
-workflow's own "Checkout" step comment for why that distinction matters).
-Reuses `ci.yml`'s Docker Build job's `type=gha` cache layer, so this is
-usually a fast, mostly-cached push rather than a cold rebuild.
+needed on that job), then builds and pushes `docker/Dockerfile` to
+Artifact Registry — production tags both `latest` and the short git SHA;
+staging tags only `staging-<short-sha>` (no `latest`, so the two tracks
+can never be confused in the shared Artifact Registry repo) — of the
+exact commit CI tested (`github.event.workflow_run.head_sha`, not
+whatever the branch happens to point at when the job actually starts —
+see the workflow's own "Checkout" step comment for why that distinction
+matters). Reuses `ci.yml`'s Docker Build job's `type=gha` cache layer, so
+this is usually a fast, mostly-cached push rather than a cold rebuild.
 
-A second job, `deploy`, `needs: build-and-push` and rolls the just-pushed
-tag out to the VM.
+Each `deploy-*` job `needs:` its track's build job and rolls the
+just-pushed tag out to that track's VM.
 
-#### `deploy` — SSH out, run `remote-deploy.sh`, roll back automatically on failure
+#### `deploy-production` / `deploy-staging` — SSH out, run `remote-deploy.sh`, roll back automatically on failure
 
 Authenticates the same WIF way, then `gcloud compute ssh`/`scp
 --tunnel-through-iap` — the same OS Login + IAP mechanism
 `scripts/provision-gcp.sh` (enables OS Login) and `scripts/gcp/setup-cicd.sh`
 (grants `github-deployer` `roles/compute.osAdminLogin` +
-`roles/iap.tunnelResourceAccessor`, scoped to the one VM instance) already
-set up — no SSH key pair anywhere, `gcloud` generates and registers an
-ephemeral one per run via the OS Login API.
+`roles/iap.tunnelResourceAccessor`, scoped to each VM instance in turn —
+see "Two VMs, one deploy identity" below) already set up — no SSH key
+pair anywhere, `gcloud` generates and registers an ephemeral one per run
+via the OS Login API.
 
-1. **Sync**: `docker/docker-compose.yml` and `scripts/gcp/remote-deploy.sh`
-   are scp'd to the VM (to the login user's home, then moved into the
-   root-owned `DEPLOY_BASE_DIR` with `sudo install`) — so a change to
-   either file in this repo takes effect on the very next deploy, not
-   just at VM provisioning time.
-2. **Deploy**: `remote-deploy.sh <short-sha>` runs over SSH — its own
+1. **Sync**: `docker/docker-compose.yml`, `docker/nginx.conf.template`,
+   and `scripts/gcp/remote-deploy.sh` are scp'd to the VM (to the login
+   user's home, then moved into the root-owned `DEPLOY_BASE_DIR` with
+   `sudo install`) — so a change to any of the three in this repo takes
+   effect on the very next deploy, not just at VM provisioning time.
+2. **Deploy**: `remote-deploy.sh <tag>` runs over SSH — its own
    stdout/stderr stream straight into the workflow log (nothing
-   redirected), so `docker compose pull`/migration output/healthcheck
-   polling are all visible in the Actions UI as they happen.
+   redirected), so the secret refresh (see "Secret flow" below),
+   `docker compose pull`/migration output/healthcheck polling are all
+   visible in the Actions UI as they happen — secret _values_ excepted,
+   which that step never prints.
 3. **Automatic rollback on failure**: if `remote-deploy.sh` exits
    non-zero (its own healthcheck timeout, per its header comment), the
    job reads `DEPLOY_BASE_DIR/.last-good-tag` off the VM (a plain SSH
@@ -482,45 +491,155 @@ ephemeral one per run via the OS Login API.
    checks rather than silently self-healed into looking like nothing
    happened. If there's no `.last-good-tag` yet (the very first deploy
    ever), there's nothing to roll back to — that's called out explicitly
-   in the log rather than attempted anyway.
-4. **On success**: a deploy summary (commit, tag, time, who approved —
-   fetched from this run's own deployment-approval record via `gh api`,
-   falling back to whoever triggered the underlying CI run) is written to
-   the workflow's Job Summary.
+   in the log rather than attempted anyway. Production and staging each
+   have their own `.last-good-tag` file on their own VM — a bad staging
+   deploy can never roll back production or vice versa.
+4. **On success**: a deploy summary (commit, tag, time, and — production
+   only — who approved, fetched from this run's own deployment-approval
+   record via `gh api`, falling back to whoever triggered the underlying
+   CI run) is written to the workflow's Job Summary.
 
-#### The "production" Environment — the human-in-the-loop gate
+#### The "production" / "staging" Environments — the human-in-the-loop gate, and where it's deliberately absent
 
-Both jobs' `environment: { name: production }` means neither starts —
-`build-and-push`'s auth/build/push, and separately `deploy`'s SSH/rollout
-— until a required reviewer approves. GitHub shares one approval across
-every job in a run that targets the same environment, so this is a single
-click, not two. Same "nothing ships without a human" rule CLAUDE.md
-Sec 2 requires of the app itself (broadcasts: draft -> AI improves ->
+`deploy-production`'s (and `build-and-push-production`'s)
+`environment: { name: production }` means neither starts until a
+required reviewer approves. GitHub shares one approval across every job
+in a run that targets the same environment, so this is a single click,
+not two. Same "nothing ships without a human" rule CLAUDE.md Sec 2
+requires of the app itself (broadcasts: draft -> AI improves ->
 **secretary approves** -> send), applied to the deploy pipeline.
 
-Creating the Environment and its required reviewers is a repo-settings
-action, not something this YAML file can declare on its own — either
-through Settings -> Environments -> New environment named exactly
-`production` -> add required reviewers, or via `gh api` (what was
-actually run for this repo):
+`staging` has **no required reviewer** — on purpose, not an oversight.
+Requiring approval to deploy to the environment whose entire job is
+letting someone look at a change _before_ deciding whether to approve it
+for production would be circular. `develop` -> staging is meant to be as
+fast and unattended as CI itself; the human gate is production's alone.
+
+Creating either Environment is a repo-settings action, not something
+this YAML file can declare on its own — either through Settings ->
+Environments -> New environment, or via `gh api` (what was actually run
+for this repo):
 
 ```bash
+# production — required reviewer, restricted to main
 gh api -X PUT repos/<owner>/<repo>/environments/production \
   -H "Accept: application/vnd.github+json" \
   -f 'reviewers[][type]=User' -F 'reviewers[][id]=<reviewer-user-id>' \
   -F 'deployment_branch_policy[protected_branches]=false' \
   -F 'deployment_branch_policy[custom_branch_policies]=true'
-
-# Restrict deployments to main only (matches cd.yml's own workflow_run
-# branches: [main] filter, belt-and-braces):
 gh api -X POST repos/<owner>/<repo>/environments/production/deployment-branch-policies \
   -f 'name=main'
+
+# staging — no reviewers, restricted to develop
+gh api -X PUT repos/<owner>/<repo>/environments/staging \
+  -H "Accept: application/vnd.github+json" \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/<owner>/<repo>/environments/staging/deployment-branch-policies \
+  -f 'name=develop'
+
+# Per-Environment variables — GCE_VM_NAME/GCE_VM_ZONE differ by
+# Environment (see "Two VMs, one deploy identity" below); the exact same
+# `${{ vars.GCE_VM_NAME }}` expression in cd.yml resolves differently
+# depending on which Environment the job references.
+gh api -X POST repos/<owner>/<repo>/environments/production/variables \
+  -f name=GCE_VM_NAME -f value=openclaw1
+gh api -X POST repos/<owner>/<repo>/environments/production/variables \
+  -f name=GCE_VM_ZONE -f value=asia-south1-c
+gh api -X POST repos/<owner>/<repo>/environments/staging/variables \
+  -f name=GCE_VM_NAME -f value=ai-housing-secretary-staging
+gh api -X POST repos/<owner>/<repo>/environments/staging/variables \
+  -f name=GCE_VM_ZONE -f value=asia-south1-a
 ```
 
 Environment protection rules (required reviewers) need the repo to be
 public, or private on a paid GitHub plan — same constraint this repo hit
 setting up branch protection (see that section's own history) — this
 repo is public, so it worked directly.
+
+#### Two VMs, one deploy identity
+
+`ai-housing-secretary-staging` (`e2-small`, `asia-south1-a`) is a second,
+smaller, fully separate VM from `openclaw1` — same provisioning script
+(`scripts/provision-gcp.sh`, just a different `VM_NAME`/`ZONE`/
+`VM_MACHINE_TYPE`/`VM_SERVICE_ACCOUNT_NAME`), same Docker/OS Login/
+Artifact-Registry-auth setup, its own dedicated service account
+(`ai-housing-staging-vm@`, distinct from production's
+`ai-housing-secretary-vm@`), its own static IP, its own `.env` and
+`.last-good-tag`. The one thing intentionally **not** duplicated is the
+deploy identity: `github-deployer@` is the same service account for both
+tracks, bound to two separate branch subjects
+(`scripts/gcp/setup-cicd.sh`'s `STAGING_BRANCH=develop`, re-run once
+against each VM to grant it instance-scoped `iap.tunnelResourceAccessor`/
+`osAdminLogin` on that VM specifically) — GitHub's branch/Environment
+gating is what actually separates the two tracks, not two unrelated GCP
+identities.
+
+**Known simplification, flagged rather than silently left implicit**:
+staging currently reads the _same_ Secret Manager secrets as production
+(`gemini-api-key`, `whatsapp-cloud-api-token`, `jwt-secret`,
+`field-encryption-key` — see "Secret flow" below), since
+`remote-deploy.sh`'s `SECRET_MAP` names are fixed, not per-environment.
+Split these into dedicated `staging-*` secret resources first if staging
+should exercise different WhatsApp Business/Gemini credentials, or if a
+`JWT_SECRET`/`FIELD_ENCRYPTION_KEY` rotation on production shouldn't also
+affect staging sessions. Also worth knowing: WhatsApp's own webhook
+verify token/app secret (`WHATSAPP_VERIFY_TOKEN`/`WHATSAPP_APP_SECRET`)
+aren't in `SECRET_MAP` at all (they're operator-chosen values, not
+Meta-issued credentials in the strict sense) — staging's `.env` uses
+placeholder values for both, since no real Meta webhook is registered
+against the staging VM.
+
+## Secret flow: what never touches GitHub, and what does
+
+The rule this whole pipeline is built around: **GitHub Actions never
+holds an app secret — only identity plumbing.**
+
+```mermaid
+flowchart TB
+    subgraph gh["GitHub Actions (cd.yml)"]
+        vars["Repo/Environment secrets & vars:<br/>WIF_PROVIDER, WIF_SERVICE_ACCOUNT,<br/>GCP_PROJECT_ID, ARTIFACT_REGISTRY_REGION,<br/>GCE_VM_NAME, GCE_VM_ZONE<br/><b>— zero app secrets —</b>"]
+    end
+
+    subgraph gcp["GCP (angular-unison-476906-s5)"]
+        wif["Workload Identity Federation<br/>(github-deployer@ SA, no key file)"]
+        sm["Secret Manager<br/>gemini-api-key · whatsapp-cloud-api-token<br/>jwt-secret · field-encryption-key"]
+        subgraph vm["Deploy VM (openclaw1 / staging)"]
+            rds["remote-deploy.sh<br/>refresh_secrets()"]
+            env[".env (root-owned, 0600)<br/>never committed, never logged"]
+            compose["docker compose up<br/>(env_file: .env)"]
+        end
+    end
+
+    gh -- "OIDC token, exchanged for a<br/>short-lived access token" --> wif
+    wif -- "artifactregistry.writer +<br/>SSH via IAP (no Secret Manager access)" --> gh
+    gh -- "SSH: run remote-deploy.sh &lt;tag&gt;" --> rds
+    rds -- "gcloud secrets versions access<br/>(VM's OWN service account,<br/>not github-deployer's)" --> sm
+    sm -- "current secret values" --> rds
+    rds -- "overwrite the 4 secret keys,<br/>never printed/logged" --> env
+    env --> compose
+```
+
+The two identities never overlap on purpose:
+
+- **`github-deployer@`** (what CI is) can push images and SSH into the
+  deploy VM. It has **no Secret Manager role at all** — even a fully
+  compromised WIF credential for this identity can't read a single app
+  secret.
+- **`ai-housing-secretary-vm@`** / **`ai-housing-staging-vm@`** (what
+  each VM's own attached identity is) has `roles/secretmanager.secretAccessor`
+  and nothing resembling deploy/push permissions. It's `remote-deploy.sh`
+  running _as this identity, on the VM itself_ — never CI — that ever
+  calls `gcloud secrets versions access`.
+
+So the actual value never leaves GCP's own boundary: Secret Manager ->
+(VM's own service account) -> `.env` on that one VM's disk, root-owned
+`0600`. GitHub only ever sees enough to say "push this image" and "run
+this script on that VM" — never the payload the script fetches once
+it's already there. See `scripts/gcp/remote-deploy.sh`'s `refresh_secrets()`
+for the implementation (temp file + atomic `install`, so a failed fetch
+partway through never leaves `.env` half-written, and nothing is ever
+piped through `echo`/logged).
 
 ## Vector store: PGVector (default) vs ChromaDB
 
@@ -534,43 +653,51 @@ standalone ChromaDB instead: set `VECTOR_DB_PROVIDER=chroma` and
 docker compose --profile chroma up -d
 ```
 
-## `scripts/provision-gcp.sh` — how it was checked (this session, not against a real GCP project)
+## The CI/CD/deploy pipeline — how it was actually verified
 
-Creating real Compute Engine/Cloud SQL/DNS/Storage resources costs money
-and isn't something to do without an explicit go-ahead, so this script was
-**not** run end-to-end against a live project. What was checked instead:
+Everything above stopped being "checked via `--help` output and hoped"
+partway through this project and became "run against a real GCP project
+and a real VM" — worth recording plainly, including the real bugs that
+only a live run surfaced (static analysis and `--help` reading missed
+every one of them):
 
-- `bash -n` (syntax) and `shellcheck` (both clean, no warnings) — for
-  `provision-gcp.sh`, `scripts/gcp/setup-cicd.sh`, and
-  `scripts/gcp/remote-deploy.sh`.
-- Every non-trivial flag (`--cpu`/`--memory` for Cloud SQL's current custom
-  machine-type syntax rather than the older `--tier=db-custom-N-M` string,
-  `--public-access-prevention` for Cloud Storage, `--metadata-from-file`
-  and `--metadata` used together for the VM startup script + OS Login,
-  `gcloud auth configure-docker`'s positional `REGISTRIES` argument,
-  `gcloud compute instances add-iam-policy-binding`/`gcloud artifacts
-repositories add-iam-policy-binding` for the instance-/repo-scoped IAM
-  grants in `setup-cicd.sh`) was confirmed against the installed `gcloud`
-  CLI's own `--help` output — a read-only query, not a resource-creating
-  one — rather than assumed from memory.
-- `gcloud compute machine-types list` (read-only) confirmed `e2-medium`
-  (the sizing default) is 2 vCPU / 4GB, matching this doc's/the script's
-  sizing rationale comments.
-- `docker compose -f docker/docker-compose.yml config` (with
-  `GCP_PROJECT_ID`/`GCP_REGION`/`AR_REPO_NAME`/`IMAGE_TAG` set) confirmed
-  the three app services' new `image:` fields render to the expected
-  Artifact Registry path (`<region>-docker.pkg.dev/<project>/<repo>/app:<tag>`),
-  all three sharing one image reference as intended.
+- **Real project, real VMs**: `openclaw1` (production) and
+  `ai-housing-secretary-staging` (staging) both actually provisioned
+  in `angular-unison-476906-s5` — service accounts, WIF pool/provider,
+  IAM bindings, Artifact Registry repo, Secret Manager secrets, Docker +
+  OS Login setup, all via the real scripts, not simulated.
+- **Real end-to-end deploys, both tracks**: `remote-deploy.sh` run
+  directly against both VMs — `docker compose pull`, migrations,
+  `up -d`, healthcheck polling — with every service (gateway, worker,
+  broadcast-worker, postgres, redis) coming up healthy and
+  `GET /health` returning `200` on each.
+- **Real bugs found and fixed this way, not any other**:
+  `iap.tunnelResourceAccessor`/`osAdminLogin` aren't grantable at the
+  Compute instance-IAM level at all (only project-level with an IAM
+  Condition); `--condition=None` is required on every _unconditioned_
+  `add-iam-policy-binding` call once a project's policy contains _any_
+  conditioned binding; `docker-compose.yml`'s `env_file: ../.env` needs
+  a `docker/` subdirectory nesting `remote-deploy.sh` wasn't originally
+  creating; Compose's project-name default changed the moment that
+  nesting was fixed, orphaning containers on the ports the next deploy
+  needed; `sudo` drops custom env vars by default, silently breaking
+  `COMPOSE_PROJECT_NAME` pinning across that boundary; `db/migrate.ts`
+  (and `seed.ts`/`ingest-knowledge.ts`) never resolved
+  `SECRETS_SOURCE=gcp` secrets at all; and, the systemic form of that
+  last one, `gateway/index.ts`'s default-parameter tool constructors
+  read raw `process.env` instead of the already-resolved config one
+  call up — fixed by having `loadEnvAsync` patch `process.env` itself.
+  None of these were hypothetical — each one blocked an actual deploy
+  until fixed.
+- **Idempotency actually re-run, not assumed**: `setup-cicd.sh` run
+  twice back-to-back against the same project confirmed via
+  `gcloud projects get-iam-policy --flatten` that no duplicate bindings
+  were created.
 
-The earlier steps in this document (Docker build, docker-compose stack,
-nginx/TLS bootstrap, healthchecks, a real migration run) _were_ verified
-live against throwaway local Docker containers — see each of those
-sections' own notes. `docker/docker-compose.yml`'s `postgres`/`redis`
-services are exactly what a real Compute Engine VM would also run (same
-images, same compose file), so that verification carries over directly;
-only the GCP-resource-creation commands themselves are unexercised here.
-`scripts/gcp/remote-deploy.sh` was similarly not run against a real VM
-(no live deploy target this session) — its `docker compose`
-pull/migrate/up sequence is the same pattern already verified live in the
-sections above, and its healthcheck-polling loop is plain bash with no
-GCP dependency.
+What's still _not_ been exercised live: Cloud SQL/DNS provisioning
+(`PROVISION_CLOUD_SQL`/`PROVISION_DNS`, both off by default — the
+self-hosted-Postgres/manually-managed-DNS path is what was actually
+run), and a real Let's Encrypt certificate issuance (needs DNS actually
+pointing at a VM's static IP, which neither `openclaw1` nor the staging
+VM has had done yet — nginx crash-loops on both for exactly this reason,
+expected per this doc's own TLS bootstrap section).
