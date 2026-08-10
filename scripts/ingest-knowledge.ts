@@ -19,6 +19,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { eq } from 'drizzle-orm';
+import { loadEnvAsync } from '../src/config/env.js';
 import { closePostgresClient, getPostgresClient } from '../src/memory/postgresAdapter.js';
 import { knowledgeDocuments } from '../src/db/schema.js';
 import { chunkText } from '../src/memory/chunking.js';
@@ -137,6 +138,10 @@ async function ingestFile(
 }
 
 async function main(): Promise<void> {
+  // Real process entry point (HLD Sec 15) — see src/db/migrate.ts's
+  // identical comment/fix; getPostgresClient()/createVectorStore() below
+  // both lazily re-validate process.env via bare loadEnv() otherwise.
+  await loadEnvAsync();
   const db = getPostgresClient();
   const vectorStore = createVectorStore();
 

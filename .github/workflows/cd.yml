@@ -184,9 +184,9 @@ jobs:
       DEPLOY_BASE_DIR: /opt/ai-housing-secretary
 
     steps:
-      # Only needed so the two files below (docker-compose.yml,
-      # remote-deploy.sh) exist locally to scp up — this job never
-      # checks out the full repo onto the VM itself (see
+      # Only needed so the files below (docker-compose.yml,
+      # nginx.conf.template, remote-deploy.sh) exist locally to scp up —
+      # this job never checks out the full repo onto the VM itself (see
       # docker/docker-compose.yml's own header comment on why: images
       # come from Artifact Registry, not a local build).
       - name: Checkout (commit CI actually tested)
@@ -227,7 +227,16 @@ jobs:
       # DEPLOY_BASE_DIR is root-owned 0755 (scripts/provision-gcp.sh), so
       # these can't scp directly into it — copy to the login user's home
       # first, then move into place with sudo over a second SSH call.
-      - name: Sync docker-compose.yml + remote-deploy.sh to the VM
+      #
+      # docker-compose.yml + nginx.conf.template land under
+      # DEPLOY_BASE_DIR/docker/ (not DEPLOY_BASE_DIR itself) — load-
+      # bearing, not cosmetic: docker-compose.yml's own `env_file:
+      # ../.env` only resolves to DEPLOY_BASE_DIR/.env if the compose
+      # file is one directory below it. See
+      # scripts/gcp/remote-deploy.sh's header comment for the same note
+      # from the other side of this handoff. `install -D` creates
+      # DEPLOY_BASE_DIR/docker/ on first run if it doesn't exist yet.
+      - name: Sync docker-compose.yml + nginx.conf.template + remote-deploy.sh to the VM
         run: |
           set -euo pipefail
           COMMON_FLAGS=(--zone="${{ vars.GCE_VM_ZONE }}" --project="${{ vars.GCP_PROJECT_ID }}" --tunnel-through-iap --quiet)
@@ -235,12 +244,15 @@ jobs:
           gcloud compute scp "${COMMON_FLAGS[@]}" \
             docker/docker-compose.yml "${{ vars.GCE_VM_NAME }}:~/docker-compose.yml.new"
           gcloud compute scp "${COMMON_FLAGS[@]}" \
+            docker/nginx.conf.template "${{ vars.GCE_VM_NAME }}:~/nginx.conf.template.new"
+          gcloud compute scp "${COMMON_FLAGS[@]}" \
             scripts/gcp/remote-deploy.sh "${{ vars.GCE_VM_NAME }}:~/remote-deploy.sh.new"
 
           gcloud compute ssh "${{ vars.GCE_VM_NAME }}" "${COMMON_FLAGS[@]}" --command="
-            sudo install -o root -g root -m 0644 ~/docker-compose.yml.new ${DEPLOY_BASE_DIR}/docker-compose.yml &&
+            sudo install -D -o root -g root -m 0644 ~/docker-compose.yml.new ${DEPLOY_BASE_DIR}/docker/docker-compose.yml &&
+            sudo install -D -o root -g root -m 0644 ~/nginx.conf.template.new ${DEPLOY_BASE_DIR}/docker/nginx.conf.template &&
             sudo install -o root -g root -m 0755 ~/remote-deploy.sh.new ${DEPLOY_BASE_DIR}/remote-deploy.sh &&
-            rm -f ~/docker-compose.yml.new ~/remote-deploy.sh.new
+            rm -f ~/docker-compose.yml.new ~/nginx.conf.template.new ~/remote-deploy.sh.new
           "
 
       # The core of this job. Not `set -e`: a failed deploy is an

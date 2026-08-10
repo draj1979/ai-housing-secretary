@@ -156,11 +156,36 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
  * `client` is injectable (defaults to the real `SecretManagerServiceClient`
  * inside `resolveSecretsIntoEnv`) purely so tests can exercise the
  * `SECRETS_SOURCE=gcp` path without a real GCP call — see env.test.ts.
+ *
+ * When `source` is the default `process.env` (i.e. a real process boot,
+ * not a test injecting its own fake source object), the resolved patch
+ * is also applied back onto `process.env` itself, not just returned.
+ * This is load-bearing, confirmed by a real SECRETS_SOURCE=gcp deploy
+ * throwing without it: several call sites elsewhere in this codebase
+ * lazily construct a Postgres client via a bare `getPostgresClient()`
+ * default-parameter value (memory/postgresAdapter.ts ->
+ * `loadEnv()` -> raw `process.env`) rather than threading the already-
+ * resolved `Env` this function returns through every layer —
+ * `gateway/index.ts`'s `createOpenClawGateway()` calling
+ * `createComplaintTool()`/`createSuggestionTool()` with no arguments is
+ * one such case. Without this mutation, that inner `loadEnv()` re-
+ * validates the *unresolved* `process.env` and throws on any field
+ * (JWT_SECRET, FIELD_ENCRYPTION_KEY, ...) that only ever had a value via
+ * Secret Manager — even though this function's own caller already has
+ * the correctly-resolved `Env` sitting right there, just not passed
+ * down. Gated on `source === process.env` specifically so a test that
+ * passes its own fake source (see env.test.ts/secrets.test.ts) never
+ * leaks a patch into the real global `process.env` and pollutes other
+ * tests.
  */
 export async function loadEnvAsync(
   source: NodeJS.ProcessEnv = process.env,
   client?: SecretManagerClientLike,
 ): Promise<Env> {
   const resolved = await resolveSecretsIntoEnv(source, client);
-  return envSchema.parse(resolved);
+  const env = envSchema.parse(resolved);
+  if (source === process.env) {
+    Object.assign(process.env, resolved);
+  }
+  return env;
 }
