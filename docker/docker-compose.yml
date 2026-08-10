@@ -7,9 +7,21 @@
 # already exist and ../.env is filled in.
 #
 # Usage: `docker compose --env-file ../.env -f docker-compose.yml up -d`
+#
+# `image:` + `build:` together on the three app services below (all three
+# are the *same* image — one Dockerfile, one build, CMD overridden per
+# service — see docker/Dockerfile's own header comment): local dev keeps
+# using `build:` (`docker compose up -d --build`, no registry needed);
+# `scripts/gcp/remote-deploy.sh` on the deploy VM instead runs
+# `docker compose pull`, which fetches this same tag from Artifact
+# Registry — CI never needs `build:` context (no repo checkout on the VM).
+# GCP_REGION/GCP_PROJECT_ID/AR_REPO_NAME/IMAGE_TAG come from ../.env (see
+# scripts/gcp/setup-cicd.sh's printed ARTIFACT_REGISTRY_REGION/GCP_PROJECT_ID
+# values for the first two).
 
 services:
   gateway:
+    image: ${GCP_REGION:-asia-south1}-docker.pkg.dev/${GCP_PROJECT_ID:-ai-housing-secretary-local}/${AR_REPO_NAME:-ai-housing-secretary}/app:${IMAGE_TAG:-latest}
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -31,6 +43,7 @@ services:
   # (gateway/queue.ts) — separate process so the HTTP webhook can respond
   # within the <5s NFR without waiting on message processing.
   worker:
+    image: ${GCP_REGION:-asia-south1}-docker.pkg.dev/${GCP_PROJECT_ID:-ai-housing-secretary-local}/${AR_REPO_NAME:-ai-housing-secretary}/app:${IMAGE_TAG:-latest}
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -52,6 +65,7 @@ services:
   # Consumes gateway/broadcastQueue.ts's delayed jobs (scheduled
   # announcements, HLD Sec 6.1) — see gateway/broadcastWorker.ts.
   broadcast-worker:
+    image: ${GCP_REGION:-asia-south1}-docker.pkg.dev/${GCP_PROJECT_ID:-ai-housing-secretary-local}/${AR_REPO_NAME:-ai-housing-secretary}/app:${IMAGE_TAG:-latest}
     build:
       context: ..
       dockerfile: docker/Dockerfile

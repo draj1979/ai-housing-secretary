@@ -77,11 +77,12 @@ STAGING_BRANCH="${STAGING_BRANCH:-}"
 # How the deploy service account reaches the VM to run the actual deploy
 # (pull the new image, `docker compose up -d`). Two options, both scoped
 # to the single VM instance (never project-wide):
-#   oslogin         (default, narrower) — roles/compute.osLogin +
-#                    roles/iap.tunnelResourceAccessor. Lets the SA SSH in
-#                    as a normal (non-admin) OS Login user through an IAP
-#                    tunnel; nothing else (can't stop/reset/delete the VM,
-#                    can't touch other instances).
+#   oslogin         (default, narrower) — OS_LOGIN_ROLE (see below;
+#                    defaults to roles/compute.osAdminLogin, needed for
+#                    unattended `sudo docker compose` — see that var's own
+#                    comment) + roles/iap.tunnelResourceAccessor. Lets the
+#                    SA SSH in through an IAP tunnel; nothing else (can't
+#                    stop/reset/delete the VM, can't touch other instances).
 #   instance-admin   — roles/compute.instanceAdmin.v1 +
 #                    roles/iap.tunnelResourceAccessor, both scoped to this
 #                    one instance. Broader (also allows start/stop/reset/
@@ -89,13 +90,22 @@ STAGING_BRANCH="${STAGING_BRANCH:-}"
 #                    needs that (e.g. resetting the VM as part of rollout).
 DEPLOY_VM_ACCESS_MODE="${DEPLOY_VM_ACCESS_MODE:-oslogin}"
 
-# roles/compute.osLogin is the correct role for a same-project/org service
-# account (this one). roles/compute.osLoginExternalUser exists for
-# identities *outside* your Cloud Identity org (e.g. a Domain Restricted
-# Sharing org policy) — override to that here only if your org's policies
-# actually require it; it is not the common case and is not narrower than
-# compute.osLogin, just differently scoped.
-OS_LOGIN_ROLE="${OS_LOGIN_ROLE:-roles/compute.osLogin}"
+# roles/compute.osAdminLogin (not the plain roles/compute.osLogin) is the
+# default here on purpose: CI runs docker/docker compose non-interactively
+# over SSH (scripts/gcp/remote-deploy.sh) with no TTY to answer a sudo
+# password prompt. osAdminLogin is what makes the linked OS Login POSIX
+# user a passwordless member of `google-sudoers` — see
+# https://cloud.google.com/compute/docs/oslogin/set-up-oslogin#configure_users
+# — so `sudo docker compose ...` in remote-deploy.sh actually runs
+# unattended. Plain roles/compute.osLogin (regular, non-sudo user) only
+# works if you instead put the OS Login user in the VM's local `docker`
+# group yourself (not automated by this script, since OS Login usernames
+# are generated per-identity and not known ahead of time) — override to
+# that only if you've done so. roles/compute.osLoginExternalUser is a
+# separate axis (identities *outside* your Cloud Identity org, e.g. a
+# Domain Restricted Sharing policy) — not relevant to this same-project
+# service account.
+OS_LOGIN_ROLE="${OS_LOGIN_ROLE:-roles/compute.osAdminLogin}"
 
 # -----------------------------------------------------------------------------
 # Helpers
