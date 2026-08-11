@@ -14,17 +14,13 @@
  * Usage:
  *   pnpm knowledge:ingest
  */
-import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { eq } from 'drizzle-orm';
 import { loadEnvAsync } from '../src/config/env.js';
 import { closePostgresClient, getPostgresClient } from '../src/memory/postgresAdapter.js';
-import { knowledgeDocuments } from '../src/db/schema.js';
-import { chunkText } from '../src/memory/chunking.js';
-import { embedBatch } from '../src/memory/embeddings.js';
 import { createVectorStore } from '../src/memory/vectorStore.js';
+import { ingestDocument } from '../src/modules/documents.js';
 
 const KNOWLEDGE_DIR = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -66,10 +62,15 @@ function deriveTitle(filename: string, content: string): string {
     .join(' ');
 }
 
-function contentHash(content: string): string {
-  return createHash('sha256').update(content).digest('hex');
-}
-
+/**
+ * Reads one local file and hands it to modules/documents.ts's
+ * ingestDocument() — the same chunk/embed/upsert logic
+ * gateway/adminDocumentsRoutes.ts's upload endpoint uses, so this CLI
+ * path and the dashboard can never disagree about what "ingested" means.
+ * This function's own job is just "turn a filename into
+ * ingestDocument's inputs": deriving a title, mapping the filename to a
+ * category, and reading the file as UTF-8 text.
+ */
 async function ingestFile(
   db: ReturnType<typeof getPostgresClient>,
   vectorStore: ReturnType<typeof createVectorStore>,
@@ -86,55 +87,9 @@ async function ingestFile(
   const content = await readFile(fullPath, 'utf-8');
   const title = deriveTitle(filename, content);
   const sourceUri = path.posix.join('docs', 'knowledge', filename);
-  const hash = contentHash(content);
 
-  const [existing] = await db
-    .select()
-    .from(knowledgeDocuments)
-    .where(eq(knowledgeDocuments.sourceUri, sourceUri))
-    .limit(1);
-
-  const changed = !existing || existing.contentHash !== hash;
-  const version = existing ? existing.version + (changed ? 1 : 0) : 1;
-
-  const [document] = existing
-    ? await db
-        .update(knowledgeDocuments)
-        .set({ title, category, version, contentHash: hash })
-        .where(eq(knowledgeDocuments.id, existing.id))
-        .returning()
-    : await db
-        .insert(knowledgeDocuments)
-        .values({ title, category, sourceUri, version, contentHash: hash })
-        .returning();
-
-  if (!document) throw new Error(`Failed to upsert knowledge_documents row for ${filename}.`);
-
-  // Re-chunk and re-embed even when unchanged is wasteful but harmless; skip
-  // the (comparatively expensive) embedding call when content is unchanged.
-  if (changed) {
-    const chunks = chunkText(content);
-    const embeddings = await embedBatch(
-      chunks.map((c) => c.content),
-      'document',
-    );
-
-    await vectorStore.deleteDocumentChunks(document.id);
-    await vectorStore.upsertChunks(
-      chunks.map((chunk, i) => ({
-        documentId: document.id,
-        chunkIndex: chunk.index,
-        content: chunk.content,
-        embedding: embeddings[i] ?? [],
-        category,
-        metadata: { title, sourceUri, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
-      })),
-    );
-
-    return { file: filename, title, category, chunkCount: chunks.length, version, changed };
-  }
-
-  return { file: filename, title, category, chunkCount: 0, version, changed };
+  const result = await ingestDocument(db, vectorStore, { title, category, sourceUri, content });
+  return { file: filename, ...result };
 }
 
 async function main(): Promise<void> {

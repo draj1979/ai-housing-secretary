@@ -79,53 +79,83 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
   return Array.isArray(value) ? value[0] : value;
 }
 
-/** Registers the GET (verification) and POST (event intake) webhook routes on `app`. */
+/**
+ * Registers the GET (verification) and POST (event intake) webhook routes
+ * — inside an *encapsulated* child context (`app.register(async (instance) => ...)`,
+ * not directly on `app`), so the raw-buffer `application/json` content-type
+ * parser below only applies to these two routes. Confirmed live: getting
+ * this wrong (calling `app.addContentTypeParser` directly on the shared
+ * top-level instance, as an earlier version of this function did) silently
+ * broke JSON body parsing for *every other* route on the same app —
+ * gateway/adminRoutes.ts's `POST /admin/escalations/:ref/status` and
+ * gateway/adminResidentsRoutes.ts's `POST /admin/residents` would each
+ * receive a raw `Buffer` as `request.body` instead of a parsed object
+ * whenever this file's routes were also registered on the same instance
+ * (i.e. every real deployment, since gateway/index.ts always registers
+ * both) — invisible in either route's own unit tests, since those each
+ * build a bare `Fastify()` instance that never also registers this file's
+ * routes.
+ */
 export function registerWebhookRoutes(app: FastifyInstance, deps: WebhookDeps): void {
   const routePath = deps.path ?? '/webhook';
 
-  // Capture the raw bytes instead of letting Fastify parse JSON for us —
-  // signature verification must hash the exact bytes Meta signed, and
-  // parsing-then-reserializing is not guaranteed to reproduce them byte-for-byte.
-  app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (_request, body, done) => {
-    done(null, body);
-  });
+  // Registration is synchronous from this function's own caller's point of
+  // view (matches every other `register*Routes` function in gateway/ —
+  // none of them are awaited at the call site); Fastify resolves the
+  // plugin during `app.ready()`/the first `.listen()`/`.inject()` call,
+  // same as any other `app.register(...)`.
+  void app.register(async (instance) => {
+    // Capture the raw bytes instead of letting Fastify parse JSON for us —
+    // signature verification must hash the exact bytes Meta signed, and
+    // parsing-then-reserializing is not guaranteed to reproduce them
+    // byte-for-byte. Scoped to `instance` (this plugin's encapsulated
+    // context), not `app` — see this function's own doc comment for why
+    // that distinction is load-bearing.
+    instance.addContentTypeParser(
+      'application/json',
+      { parseAs: 'buffer' },
+      (_request, body, done) => {
+        done(null, body);
+      },
+    );
 
-  app.get(routePath, async (request, reply) => {
-    const challenge = verifyChallenge(request.query as Record<string, unknown>, deps.verifyToken);
-    if (challenge === null) {
-      return reply.code(403).send('Forbidden');
-    }
-    return reply.code(200).send(challenge);
-  });
+    instance.get(routePath, async (request, reply) => {
+      const challenge = verifyChallenge(request.query as Record<string, unknown>, deps.verifyToken);
+      if (challenge === null) {
+        return reply.code(403).send('Forbidden');
+      }
+      return reply.code(200).send(challenge);
+    });
 
-  app.post(routePath, async (request, reply) => {
-    const log = deps.logger ?? request.log;
-    const rawBody = request.body as Buffer;
-    const signature = firstHeaderValue(request.headers['x-hub-signature-256']);
+    instance.post(routePath, async (request, reply) => {
+      const log = deps.logger ?? request.log;
+      const rawBody = request.body as Buffer;
+      const signature = firstHeaderValue(request.headers['x-hub-signature-256']);
 
-    if (!verifySignature(rawBody, signature, deps.appSecret)) {
-      log.warn('Rejected WhatsApp webhook POST: invalid or missing X-Hub-Signature-256.');
-      return reply.code(401).send({ error: 'invalid signature' });
-    }
+      if (!verifySignature(rawBody, signature, deps.appSecret)) {
+        log.warn('Rejected WhatsApp webhook POST: invalid or missing X-Hub-Signature-256.');
+        return reply.code(401).send({ error: 'invalid signature' });
+      }
 
-    let payload: unknown;
-    try {
-      payload = JSON.parse(rawBody.toString('utf-8'));
-    } catch {
-      log.warn('Rejected WhatsApp webhook POST: body is not valid JSON.');
-      return reply.code(400).send({ error: 'invalid JSON' });
-    }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(rawBody.toString('utf-8'));
+      } catch {
+        log.warn('Rejected WhatsApp webhook POST: body is not valid JSON.');
+        return reply.code(400).send({ error: 'invalid JSON' });
+      }
 
-    try {
-      await deps.enqueue(payload);
-    } catch (err) {
-      // Non-2xx here makes Meta retry the delivery — preferable to silently
-      // losing an event we failed to even queue.
-      log.error({ err }, 'Failed to enqueue inbound WhatsApp webhook payload.');
-      return reply.code(500).send({ error: 'failed to queue event' });
-    }
+      try {
+        await deps.enqueue(payload);
+      } catch (err) {
+        // Non-2xx here makes Meta retry the delivery — preferable to
+        // silently losing an event we failed to even queue.
+        log.error({ err }, 'Failed to enqueue inbound WhatsApp webhook payload.');
+        return reply.code(500).send({ error: 'failed to queue event' });
+      }
 
-    return reply.code(200).send({ status: 'received' });
+      return reply.code(200).send({ status: 'received' });
+    });
   });
 }
 

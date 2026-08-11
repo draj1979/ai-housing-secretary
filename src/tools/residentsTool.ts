@@ -46,8 +46,12 @@ export interface ResidentsTool {
   getContactById(residentId: string): Promise<ResidentContact | null>;
   /** Decrypted phone numbers for every resident — tools/broadcastTool.ts's recipient list. */
   listAllPhones(): Promise<string[]>;
+  /** Every resident, decrypted — gateway/adminResidentsRoutes.ts's dashboard list (small society rosters; no pagination yet). */
+  listAll(): Promise<ResidentContact[]>;
   /** Insert-or-update by phone number (scripts/seed.ts) — encrypts and hashes before writing. */
   upsert(input: UpsertResidentInput): Promise<{ id: string; phoneE164: string }>;
+  /** Removes a resident by id. Returns false if no such resident existed (idempotent from the caller's view). */
+  remove(residentId: string): Promise<boolean>;
 }
 
 export interface ResidentsToolDeps {
@@ -90,6 +94,11 @@ export function createResidentsTool(deps: ResidentsToolDeps): ResidentsTool {
       return rows.map((row) => enc.decrypt(row.phoneE164));
     },
 
+    async listAll() {
+      const rows = await db.select().from(residents);
+      return rows.map((row) => toContact(row, enc));
+    },
+
     async upsert(input) {
       const phoneCiphertext = enc.encrypt(input.phoneE164);
       const phoneHash = enc.hashForLookup(input.phoneE164);
@@ -121,6 +130,14 @@ export function createResidentsTool(deps: ResidentsToolDeps): ResidentsTool {
       if (!row) throw new Error('Failed to upsert resident.');
 
       return { id: row.id, phoneE164: input.phoneE164 };
+    },
+
+    async remove(residentId) {
+      const deleted = await db
+        .delete(residents)
+        .where(eq(residents.id, residentId))
+        .returning({ id: residents.id });
+      return deleted.length > 0;
     },
   };
 }

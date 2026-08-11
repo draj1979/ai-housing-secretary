@@ -87,6 +87,21 @@ respectively. See
 All five of HLD Sec 6's functional modules are now implemented — no
 `src/modules/` scaffolding remains.
 
+## Admin Dashboard (Phase 2, partial)
+
+`gateway/adminDashboard.ts` + `gateway/adminDocumentsRoutes.ts` +
+`gateway/adminResidentsRoutes.ts` + `modules/documents.ts` — a
+secretary-facing HTML page (`GET /admin/dashboard`) for society document
+upload/management (reusing `scripts/ingest-knowledge.ts`'s
+chunk/embed/vector-store pipeline via the new shared
+`modules/documents.ts`) and resident roster CRUD (thin wrapper over
+`tools/residentsTool.ts`'s existing field-encryption-aware methods). Same
+`gateway/adminAuth.ts` JWT auth as the pre-existing `/admin/escalations`
+surface. See [`docs/admin-dashboard.md`](admin-dashboard.md) — including a
+significant `gateway/webhook.ts` content-type-parser encapsulation bug this
+feature's live verification caught and fixed, which had been silently
+corrupting JSON bodies on `/admin/escalations` too.
+
 The **database schema**, the **memory layer**, the **WhatsApp tool +
 webhook intake**, the **OpenClaw Gateway** (session/tools/memory/agent
 orchestration), and all five functional modules are implemented — see
