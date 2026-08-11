@@ -310,6 +310,25 @@ changed.
 
 ## CI/CD Auth: how GitHub Actions deploys without a service account key
 
+> **Update, live-verified**: `.github/workflows/cd.yml` no longer
+> impersonates `github-deployer@` — the `roles/iam.workloadIdentityUser` +
+> `service_account:` impersonation path described in this section was
+> abandoned after the impersonation call
+> (`iam.serviceAccounts.getAccessToken`) was denied on every attempt, for
+> every subject tried, with no explanation available from GCP's IAM
+> Policy Troubleshooter or Cloud Logging. `cd.yml` now uses **Direct**
+> Workload Identity Federation instead: IAM roles granted straight to a
+> `principalSet` (`attribute.repository`, scoped to this one repo) rather
+> than to a service account a workflow impersonates — no
+> `WIF_SERVICE_ACCOUNT` secret, no `service_account:` input. See
+> `cd.yml`'s own header comment for the full story. The rest of this
+> section (and `scripts/gcp/setup-cicd.sh`, which still provisions the
+> old impersonation-based setup) has not been rewritten for the new model
+> yet — treat the specific `github-deployer@`/`WIF_SERVICE_ACCOUNT`
+> details below as historical, the general WIF concepts (no key file,
+> short-lived exchanged credentials, resource-scoped roles) as still
+> accurate.
+
 `scripts/gcp/setup-cicd.sh` provisions everything GitHub Actions needs to
 build/push images and deploy to this VM — an Artifact Registry repo, a
 dedicated `github-deployer@<project>.iam` service account, and a Workload
