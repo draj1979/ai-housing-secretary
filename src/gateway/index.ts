@@ -73,6 +73,7 @@ import { registerAdminRoutes } from './adminRoutes.js';
 import { registerAdminResidentsRoutes } from './adminResidentsRoutes.js';
 import { registerAdminDocumentsRoutes } from './adminDocumentsRoutes.js';
 import { registerAdminDashboard } from './adminDashboard.js';
+import { registerAdminLoginRoutes } from './adminLoginRoutes.js';
 import { createDocumentStorage } from '../modules/documentStorage.js';
 import { createDocumentsModule } from '../modules/documents.js';
 import {
@@ -255,6 +256,24 @@ export async function createGateway() {
     });
 
     registerAdminDashboard(app);
+
+    // Username/password login for the dashboard — see
+    // gateway/adminLoginRoutes.ts's own doc comment. Gated on
+    // ADMIN_PASSWORD_HASH the same way document upload is gated on
+    // GCP_STORAGE_BUCKET: a deployment that hasn't set a password yet
+    // still gets the rest of /admin/* (including
+    // scripts/mint-admin-token.ts's out-of-band token path).
+    if (env.ADMIN_PASSWORD_HASH) {
+      registerAdminLoginRoutes(app, {
+        authConfig,
+        username: env.ADMIN_USERNAME,
+        passwordHash: env.ADMIN_PASSWORD_HASH,
+      });
+    } else {
+      app.log.warn(
+        'ADMIN_PASSWORD_HASH not set — /admin/login (dashboard username/password sign-in) not mounted. Use scripts/mint-admin-token.ts to issue tokens instead.',
+      );
+    }
 
     // See this function's own doc comment for why document upload needs
     // its own, wider gate than the rest of /admin/*.

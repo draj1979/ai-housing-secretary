@@ -6,8 +6,9 @@
  * `loadEnv`) is the *shape* of configuration and the local-dev path; this
  * file is what makes `SECRETS_SOURCE=gcp` actually replace the plaintext
  * secret values — GEMINI_API_KEY, WHATSAPP_CLOUD_API_TOKEN, DATABASE_URL,
- * JWT_SECRET — with ones fetched from Secret Manager at process start,
- * before `loadEnv`'s Zod validation runs.
+ * JWT_SECRET, FIELD_ENCRYPTION_KEY, ADMIN_PASSWORD_HASH — with ones
+ * fetched from Secret Manager at process start, before `loadEnv`'s Zod
+ * validation runs.
  *
  * See CLAUDE.md's "Secrets" section for the local-dev-only warning on
  * `.env`, and .env.example's GCP_SECRET_* vars for the resource-name shape
@@ -28,6 +29,7 @@ const SECRET_TARGETS: ReadonlyArray<{ envKey: string; resourceNameEnvKey: string
   { envKey: 'DATABASE_URL', resourceNameEnvKey: 'GCP_SECRET_DATABASE_URL' },
   { envKey: 'JWT_SECRET', resourceNameEnvKey: 'GCP_SECRET_JWT_SECRET' },
   { envKey: 'FIELD_ENCRYPTION_KEY', resourceNameEnvKey: 'GCP_SECRET_FIELD_ENCRYPTION_KEY' },
+  { envKey: 'ADMIN_PASSWORD_HASH', resourceNameEnvKey: 'GCP_SECRET_ADMIN_PASSWORD_HASH' },
 ];
 
 export interface AccessSecretVersionResult {

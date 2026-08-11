@@ -178,6 +178,7 @@ SECRET_MAP=(
   "WHATSAPP_CLOUD_API_TOKEN:whatsapp-cloud-api-token"
   "JWT_SECRET:jwt-secret"
   "FIELD_ENCRYPTION_KEY:field-encryption-key"
+  "ADMIN_PASSWORD_HASH:admin-password-hash"
 )
 
 # Writes ENV_FILE's contents to stdout via sudo when needed — the one
