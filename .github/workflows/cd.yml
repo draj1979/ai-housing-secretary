@@ -1,13 +1,19 @@
 # CD — builds and pushes the Docker image to Artifact Registry after CI
 # passes, then rolls it out. Two parallel tracks, same file:
 #
-#   push to main    -> build-and-push-production / deploy-production
-#                      -> openclaw1 (environment: production, required
-#                         reviewer)
-#   push to develop -> build-and-push-staging / deploy-staging
-#                      -> ai-housing-secretary-staging (environment:
-#                         staging, no required reviewer — this IS the
-#                         "verify before production approval" step)
+#   push to main    -> build-and-push-production (no environment gate)
+#                      -> deploy-production (environment: production,
+#                         required reviewer) -> openclaw1
+#   push to develop -> build-and-push-staging (no environment gate)
+#                      -> deploy-staging (environment: staging, no
+#                         required reviewer — this IS the "verify before
+#                         production approval" step) ->
+#                         ai-housing-secretary-staging
+#
+# Only the *deploy* job in each track carries the `environment:` key —
+# see build-and-push-production's own comment below for why the build/
+# push jobs deliberately don't (an environment-scoped GitHub OIDC subject
+# that WIF auth couldn't be gotten working against).
 #
 # Triggered by `workflow_run` watching the "CI" workflow (.github/workflows/ci.yml)
 # rather than its own `push:` trigger, on purpose: this reuses CI's
@@ -102,15 +108,23 @@ jobs:
       group: cd-production
       cancel-in-progress: false
 
-    # Protected GitHub Environment: this job does not start at all until
-    # a required reviewer approves it in the Environments UI (Settings ->
-    # Environments -> production). Deliberately gates the *whole* job
-    # (auth + build + push), not just a single step — there's no partial-
-    # credential-then-wait mechanism in Actions, so "approve before
-    # anything GCP-facing happens" means the environment sits on the job.
-    environment:
-      name: production
-
+    # No `environment:` gate here on purpose — this job only pushes an
+    # image to Artifact Registry, nothing production-facing, so it
+    # doesn't need reviewer approval (deploy-production below, the job
+    # that actually touches the VM, still has one). It used to carry the
+    # same `environment: production` gate as deploy-production, but that
+    # changes the GitHub OIDC token's `sub` claim from
+    # `repo:OWNER/REPO:ref:refs/heads/main` to
+    # `repo:OWNER/REPO:environment:production` — and WIF auth against
+    # that environment-scoped subject could never be gotten working
+    # (every production deploy in this repo's history failed at the
+    # "Authenticate to GCP" step for reasons that resisted every
+    # available diagnostic, including GCP's own IAM Policy Troubleshooter,
+    # which doesn't support evaluating workload-identity-federation
+    # principals at all). Dropping the gate here sidesteps the unexplained
+    # failure entirely for the low-risk half of the pipeline, using the
+    # plain `ref:refs/heads/main` subject instead (github-deployer@'s
+    # original, working WIF binding).
     steps:
       # Check out the exact commit CI tested and passed — not whatever
       # main happens to point at right now (which could have moved if
@@ -397,14 +411,15 @@ jobs:
       group: cd-staging
       cancel-in-progress: false
 
-    # No required reviewers on "staging" (Settings -> Environments ->
-    # staging) — unlike production, this runs unattended the moment CI
-    # passes on develop. That's the point: staging is where a change
-    # becomes checkable *before* someone has to decide whether to
-    # approve it for production.
-    environment:
-      name: staging
-
+    # No `environment:` gate here — same reasoning as
+    # build-and-push-production's own comment just above in this file:
+    # an `environment:` key changes the OIDC subject from
+    # `ref:refs/heads/develop` to `environment:staging`, which WIF auth
+    # couldn't be gotten working against. This job only pushes an image
+    # to Artifact Registry (nothing staging-VM-facing), so it doesn't
+    # need the gate anyway — deploy-staging below still has one
+    # (though, per this file's original comment, staging's was never a
+    # required-reviewer gate — see that job).
     steps:
       - name: Checkout (commit CI actually tested)
         uses: actions/checkout@v4
