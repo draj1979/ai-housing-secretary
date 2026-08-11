@@ -13,11 +13,13 @@
  *
  * Auth model: the page itself is served with no server-side session —
  * anyone who knows the URL can *load* it, but every API call it makes
- * needs a valid admin JWT (scripts/mint-admin-token.ts), which the
- * Secretary pastes in once and the page keeps in `localStorage` (never
- * sent anywhere but this app's own `/admin/*` endpoints). This mirrors
- * gateway/adminAuth.ts's deliberate "no invented login flow" design —
- * see that file's own doc comment.
+ * needs a valid admin JWT. The login form here POSTs to
+ * gateway/adminLoginRoutes.ts's `/admin/login` (username + password,
+ * rate-limited) to get one; scripts/mint-admin-token.ts still exists as
+ * an out-of-band alternative (scripting, emergency access if the login
+ * endpoint itself is ever down). Either way the token is kept in
+ * `localStorage` (never sent anywhere but this app's own `/admin/*`
+ * endpoints).
  */
 import type { FastifyInstance } from 'fastify';
 
@@ -112,9 +114,10 @@ const DASHBOARD_HTML = `<!doctype html>
   }
   #login-screen h1 { font-size: 18px; margin: 0 0 6px; }
   #login-screen p { color: var(--text-muted); font-size: 13.5px; margin: 0 0 18px; line-height: 1.5; }
-  textarea#token-input {
-    width: 100%; min-height: 90px; padding: 10px; border: 1px solid var(--border); border-radius: 7px;
-    font-family: ui-monospace, monospace; font-size: 12.5px; resize: vertical; margin-bottom: 12px;
+  #login-screen label { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 4px; }
+  #login-screen input {
+    width: 100%; padding: 9px 10px; border: 1px solid var(--border); border-radius: 7px;
+    font-size: 14px; margin-bottom: 14px; box-sizing: border-box;
   }
   #app { display: none; }
 </style>
@@ -123,10 +126,14 @@ const DASHBOARD_HTML = `<!doctype html>
 
 <div id="login-screen">
   <h1>Admin sign-in</h1>
-  <p>Paste the admin token you were given (see <code>pnpm admin:mint-token</code> in
-  docs/admin-dashboard.md if you're setting this up). It's kept only in this browser.</p>
-  <textarea id="token-input" placeholder="eyJhbGciOi..."></textarea>
-  <button class="primary" id="login-btn">Continue</button>
+  <p>Sign in with your admin username and password.</p>
+  <form id="login-form">
+    <label for="username-input">Username</label>
+    <input type="text" id="username-input" autocomplete="username" required />
+    <label for="password-input">Password</label>
+    <input type="password" id="password-input" autocomplete="current-password" required />
+    <button class="primary" type="submit" id="login-btn">Sign in</button>
+  </form>
   <div id="login-error" style="color:#d43f3f;font-size:13px;margin-top:10px;"></div>
 </div>
 
@@ -258,11 +265,36 @@ const DASHBOARD_HTML = `<!doctype html>
     loadResidents();
   }
 
-  document.getElementById('login-btn').addEventListener('click', function () {
-    var value = document.getElementById('token-input').value.trim();
-    if (!value) return;
-    setToken(value);
-    showApp();
+  document.getElementById('login-form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var username = document.getElementById('username-input').value;
+    var password = document.getElementById('password-input').value;
+    var errorEl = document.getElementById('login-error');
+    var btn = document.getElementById('login-btn');
+    errorEl.textContent = '';
+    btn.disabled = true;
+    fetch('/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password }),
+    })
+      .then(function (res) {
+        return res.json().then(function (data) { return { ok: res.ok, data: data }; });
+      })
+      .then(function (result) {
+        btn.disabled = false;
+        if (!result.ok) {
+          errorEl.textContent = (result.data && result.data.error) || 'Sign-in failed.';
+          return;
+        }
+        setToken(result.data.token);
+        document.getElementById('password-input').value = '';
+        showApp();
+      })
+      .catch(function () {
+        btn.disabled = false;
+        errorEl.textContent = 'Network error — could not reach the server.';
+      });
   });
 
   document.getElementById('logout-btn').addEventListener('click', function () {

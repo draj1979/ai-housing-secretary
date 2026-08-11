@@ -3,13 +3,14 @@
  *
  * The out-of-band token issuance gateway/adminAuth.ts's doc comment
  * refers to ("mintAdminToken is a building block for however tokens
- * actually get handed out ... not an HTTP login endpoint itself") — this
- * is that "however": an operator (not the app itself) runs this once to
- * get a token to hand to the Secretary for the admin dashboard
- * (docs/admin-dashboard.md). Deliberately not an HTTP login route — the
- * HLD names no identity provider, so this repo doesn't invent one; a
- * real login flow (password, SSO, whatever) is still an open question,
- * same as it's always been (see CLAUDE.md's admin auth section).
+ * actually get handed out ... not an HTTP login endpoint itself") — an
+ * operator (not the app itself) runs this to get a token to hand to
+ * someone directly. gateway/adminLoginRoutes.ts's `/admin/login`
+ * (username + password, see scripts/hash-admin-password.ts) is now the
+ * primary way a human secretary actually gets in through the dashboard;
+ * this script stays as the out-of-band alternative — scripting, or
+ * emergency access if the login endpoint itself is ever misconfigured or
+ * down.
  *
  * Usage:
  *   pnpm admin:mint-token -- --sub "secretary@example-society.in" --role secretary

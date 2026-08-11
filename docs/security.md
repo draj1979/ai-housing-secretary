@@ -61,12 +61,23 @@ comments for the full design. Summary:
   (`gateway/index.ts`'s `createGateway`), but **only when `JWT_SECRET` is
   set** — a deployment that doesn't want this HTTP surface at all simply
   omits it and `/admin/*` doesn't exist.
-- Token issuance is deliberately out-of-band (`mintAdminToken` is a
-  building block, not an HTTP login route) — the HLD doesn't specify an
-  identity provider, so this doesn't invent one. `scripts/mint-admin-token.ts`
-  (`pnpm admin:mint-token`) is the actual out-of-band issuance mechanism —
-  run once per secretary, the token handed to them directly, never logged
-  or committed.
+- Token issuance: `gateway/adminLoginRoutes.ts`'s `POST /admin/login`
+  (username + password) is the primary path a human secretary actually
+  uses — a single fixed account (`ADMIN_USERNAME`, default `admin`),
+  password stored only as a bcrypt hash (`ADMIN_PASSWORD_HASH`,
+  Secret-Manager-backed like every other credential here — see
+  `scripts/hash-admin-password.ts`, `pnpm admin:hash-password`; the
+  plaintext password itself is never written to disk, logged, or
+  committed anywhere, this app included). Rate-limited per source IP
+  (`createLoginRateLimiter`, in-memory — this app runs as a single VM
+  instance, not a multi-replica deployment, so there's no shared-state
+  problem to solve) against brute-forcing, on top of bcrypt's own cost
+  factor slowing each guess. `scripts/mint-admin-token.ts`
+  (`pnpm admin:mint-token`) still exists as an out-of-band fallback
+  (scripting, or emergency access if `/admin/login` is ever
+  misconfigured) — the HLD doesn't specify an identity provider, so this
+  repo built the minimum that was actually asked for rather than a
+  general one.
 
 This mechanism now protects "a future committee dashboard" (HLD Sec 15's
 own phrasing) for real: `gateway/adminDashboard.ts` +

@@ -110,6 +110,12 @@ const envSchema = z.object({
   // processes (e.g. a future read-only reporting job) don't need it, but
   // tools/residentsTool.ts throws immediately if it's missing when used.
   FIELD_ENCRYPTION_KEY: z.string().min(1).optional(),
+  // Admin dashboard login (gateway/adminLoginRoutes.ts) — a single
+  // secretary account, username + bcrypt password hash. Optional at the
+  // schema level (same reasoning as JWT_SECRET/FIELD_ENCRYPTION_KEY
+  // above); adminLoginRoutes.ts itself declines to mount without both.
+  ADMIN_USERNAME: z.string().min(1).default('admin'),
+  ADMIN_PASSWORD_HASH: z.string().min(1).optional(),
 
   // GCP
   GCP_PROJECT_ID: z.string().optional(),
@@ -126,6 +132,7 @@ const envSchema = z.object({
   GCP_SECRET_DATABASE_URL: z.string().optional(),
   GCP_SECRET_JWT_SECRET: z.string().optional(),
   GCP_SECRET_FIELD_ENCRYPTION_KEY: z.string().optional(),
+  GCP_SECRET_ADMIN_PASSWORD_HASH: z.string().optional(),
 
   // Backups
   BACKUP_SCHEDULE_CRON: z.string().default('0 2 * * *'),

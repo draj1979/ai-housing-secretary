@@ -18,24 +18,46 @@ had, `tools/residentsTool.ts`'s existing field-encryption-aware resident
 CRUD, and `gateway/adminAuth.ts`'s existing JWT auth (the same
 `secretary`/`read_only` roles already protecting `/admin/escalations`).
 
-## Getting a token
+## Signing in
 
-There is deliberately no HTTP login endpoint (see `gateway/adminAuth.ts`'s
-own doc comment — the HLD doesn't specify an identity provider, so this
-repo doesn't invent a password/session flow for one admin surface). Tokens
-are minted out-of-band and handed to the secretary directly:
+The dashboard's login screen (`GET /admin/dashboard`) is a real username +
+password form, backed by `gateway/adminLoginRoutes.ts`'s `POST
+/admin/login` — a single secretary account, not a multi-user system (the
+HLD names no identity provider, and one account is what was actually
+asked for). Set it up once:
+
+```bash
+pnpm admin:hash-password
+```
+
+Prompts for a password (hidden input, never echoed or logged), prints a
+bcrypt hash — store that in Secret Manager, never the plaintext password:
+
+```bash
+printf '%s' '<hash the command printed>' | gcloud secrets versions add admin-password-hash --data-file=-
+```
+
+Set `ADMIN_USERNAME` (defaults `admin`) and
+`GCP_SECRET_ADMIN_PASSWORD_HASH` in `.env` (see `.env.example`) — from
+then on, signing in at `/admin/dashboard` with that username/password
+mints a `secretary`-role JWT under the hood and stores it in the
+browser's `localStorage`, same as before; nothing else about the API
+calls changed. Login is rate-limited per IP (`adminLoginRoutes.ts`'s
+`createLoginRateLimiter`) against brute-forcing.
+
+`scripts/mint-admin-token.ts` still works as an out-of-band fallback
+(scripting, or if the login endpoint itself is ever down):
 
 ```bash
 pnpm admin:mint-token -- --sub "secretary@example-society.in" --role secretary
 ```
 
-Prints a signed JWT (`JWT_SECRET`-backed, `adminAuth.ts`'s existing
-mechanism) valid for the configured expiry. Paste it into the dashboard's
-login screen (`GET /admin/dashboard`) — it's stored in the browser's
-`localStorage` and sent as `Authorization: Bearer <token>` on every API
-call. A `read_only` token can view documents but not upload; the resident
-roster is `secretary`-only end to end (no HLD-specified read-only viewer
-role for resident PII).
+Either path produces the same kind of token — `Authorization: Bearer
+<token>` on every `/admin/*` API call. A `read_only` token can view
+documents but not upload; the resident roster is `secretary`-only end to
+end (no HLD-specified read-only viewer role for resident PII) — the login
+form only ever issues `secretary`-role tokens, since there's only the one
+account.
 
 ## Using the dashboard
 
@@ -72,6 +94,7 @@ All routes require `Authorization: Bearer <admin JWT>` (`adminAuth.ts`).
 | `POST /admin/residents`       | `secretary`                                              | Upsert, keyed by phone number (create if new, update in place if it matches an existing resident). |
 | `DELETE /admin/residents/:id` | `secretary`                                              | 404 if unknown id.                                                                                 |
 | `GET /admin/dashboard`        | none (page itself; API calls from it still need a token) | Serves the HTML page.                                                                              |
+| `POST /admin/login`           | none (this is how a token is obtained)                   | `{username, password}` → `{token}`. Rate-limited per IP.                                           |
 
 Document categories are the six `KNOWLEDGE_CATEGORIES` HLD Sec 7.4 names
 (`modules/documents.ts`): Society Handbook, Bye-Laws, Parking Policy,

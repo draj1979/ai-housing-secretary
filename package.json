@@ -33,13 +33,15 @@
     "db:seed": "tsx scripts/seed.ts",
     "db:studio": "drizzle-kit studio",
     "knowledge:ingest": "tsx scripts/ingest-knowledge.ts",
-    "admin:mint-token": "tsx scripts/mint-admin-token.ts"
+    "admin:mint-token": "tsx scripts/mint-admin-token.ts",
+    "admin:hash-password": "tsx scripts/hash-admin-password.ts"
   },
   "dependencies": {
     "@fastify/multipart": "^10.1.0",
     "@google-cloud/secret-manager": "^6.3.0",
     "@google-cloud/storage": "^7.21.0",
     "@google/generative-ai": "^0.21.0",
+    "bcryptjs": "^3.0.3",
     "bullmq": "^6.0.9",
     "chromadb": "^1.10.5",
     "dotenv": "^16.4.5",
