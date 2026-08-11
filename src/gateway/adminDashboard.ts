@@ -154,7 +154,7 @@ const DASHBOARD_HTML = `<!doctype html>
       <div class="empty" id="documents-empty" style="display:none;">No documents uploaded yet.</div>
     </section>
 
-    <section class="panel">
+    <section class="panel" data-panel="documents">
       <h2>Upload a document</h2>
       <form class="stack" id="upload-form">
         <div>
