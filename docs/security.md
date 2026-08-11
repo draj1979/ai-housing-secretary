@@ -63,12 +63,67 @@ comments for the full design. Summary:
   omits it and `/admin/*` doesn't exist.
 - Token issuance is deliberately out-of-band (`mintAdminToken` is a
   building block, not an HTTP login route) — the HLD doesn't specify an
-  identity provider, so this doesn't invent one.
+  identity provider, so this doesn't invent one. `scripts/mint-admin-token.ts`
+  (`pnpm admin:mint-token`) is the actual out-of-band issuance mechanism —
+  run once per secretary, the token handed to them directly, never logged
+  or committed.
 
-This is scaffolding for "a future committee dashboard" (HLD Sec 15's own
-phrasing) — two routes, not a full dashboard — but the auth/RBAC mechanism
-itself is complete and reusable for whatever routes that dashboard
-eventually needs.
+This mechanism now protects "a future committee dashboard" (HLD Sec 15's
+own phrasing) for real: `gateway/adminDashboard.ts` +
+`adminDocumentsRoutes.ts` + `adminResidentsRoutes.ts`, the document
+upload / resident roster admin surface described in
+[`docs/admin-dashboard.md`](admin-dashboard.md) — same `requireAdminAuth`/
+`requireRole` mechanism as `adminRoutes.ts`'s escalations routes, no new
+auth code.
+
+## File upload (admin document upload)
+
+`gateway/adminDocumentsRoutes.ts`'s `POST /admin/documents` is the only
+route in this app that accepts an arbitrary uploaded file, so it gets its
+own layer of validation beyond the standard JWT + `secretary`-role check:
+
+- **Mimetype allowlist** — `modules/documentTextExtraction.ts`'s
+  `SUPPORTED_UPLOAD_MIME_TYPES` (`text/plain`, `text/markdown`,
+  `application/pdf` only); anything else 415s before the file is even
+  buffered into memory beyond what `@fastify/multipart` already read.
+- **Size cap** — `request.file({ limits: { fileSize } })`,
+  `DEFAULT_MAX_UPLOAD_BYTES` (20MB); `@fastify/multipart` itself rejects
+  the stream once the limit is hit, bounding one request's memory and
+  downstream embedding cost.
+- **No arbitrary code execution surface** — PDF text extraction is
+  `pdf-parse`'s `getText()` (text extraction only, no PDF rendering/
+  JS-execution path); there is no image processing, no shell-out to any
+  external tool on the uploaded bytes.
+- **Storage** — uploaded bytes go to GCS (`modules/documentStorage.ts`,
+  Application Default Credentials, no key file) under a UUID-prefixed
+  object path (`safeFilename` strips unsafe characters and truncates the
+  original filename first) — never written to local disk on the gateway
+  VM.
+- **`secretary`-only** — no `read_only` upload/delete path exists (see
+  this file's own doc comment); listing is the only `read_only`-accessible
+  document route.
+
+## A correctness bug that was also a security-relevant one
+
+`gateway/webhook.ts` used to register its raw-buffer `application/json`
+content-type parser (needed so WhatsApp signature verification hashes the
+exact bytes Meta signed) directly on the shared top-level Fastify
+instance instead of an encapsulated child plugin. That silently broke JSON
+body parsing for **every other route on the same app**, including every
+`/admin/*` JSON POST (`adminRoutes.ts`'s escalation-status update,
+`adminResidentsRoutes.ts`'s resident upsert) — `request.body` arrived as a
+raw `Buffer` instead of the parsed object those routes' validation logic
+expects. In practice this mostly manifested as those routes silently
+misbehaving (e.g. `"flatNumber" is required` on a request that clearly
+included it) rather than an auth bypass — but any hand-rolled body
+handling downstream of a broken parser is the kind of thing that
+_could_ have silently accepted or misread admin input, which is why it's
+called out here rather than only in [`docs/admin-dashboard.md`](admin-dashboard.md).
+Fixed by encapsulating `webhook.ts`'s parser/routes in their own
+`app.register(async (instance) => {...})` context; regression-tested by
+`gateway/webhookEncapsulation.test.ts`, which registers webhook + admin
+routes on one shared instance (matching real production topology) and
+would fail against the pre-fix code.
 
 ## Audit logs: every tool call that touches resident data or triggers a broadcast/escalation
 

@@ -30,6 +30,7 @@
  */
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
+import multipart from '@fastify/multipart';
 import { loadEnv, loadEnvAsync, type Env } from '../config/env.js';
 import { registerWebhookRoutes, createWebhookDepsFromEnv } from './webhook.js';
 import { registerHealthRoutes } from './health.js';
@@ -37,7 +38,7 @@ import { createRedisSessionStore, type SessionStore } from './session.js';
 import { createToolRegistry, type ToolRegistry } from './toolRegistry.js';
 import { createOrchestrator, type Orchestrator } from './orchestrator.js';
 import { createConversationStore, type ConversationStore } from '../memory/conversationStore.js';
-import { getPostgresPool } from '../memory/postgresAdapter.js';
+import { getPostgresClient, getPostgresPool } from '../memory/postgresAdapter.js';
 import { Redis } from 'ioredis';
 import { createVectorStore, type VectorStore } from '../memory/vectorStore.js';
 import {
@@ -69,6 +70,11 @@ import { createBroadcastScheduler } from './broadcastQueue.js';
 import { createEscalationModule } from '../modules/escalation.js';
 import { adminAuthConfigFromEnv } from './adminAuth.js';
 import { registerAdminRoutes } from './adminRoutes.js';
+import { registerAdminResidentsRoutes } from './adminResidentsRoutes.js';
+import { registerAdminDocumentsRoutes } from './adminDocumentsRoutes.js';
+import { registerAdminDashboard } from './adminDashboard.js';
+import { createDocumentStorage } from '../modules/documentStorage.js';
+import { createDocumentsModule } from '../modules/documents.js';
 import {
   createGeminiResponder,
   geminiResponderConfigFromEnv,
@@ -172,9 +178,18 @@ export function createOpenClawGateway(env: Env = loadEnv()): OpenClawGateway {
  * gateway.
  *
  * Admin routes (gateway/adminRoutes.ts, HLD Sec 15) are the one exception:
- * they *do* need Postgres (to read/act on escalations) and are registered
- * only when `JWT_SECRET` is set — a deployment that doesn't want this
- * surface at all simply omits it and `/admin/*` doesn't exist.
+ * they *do* need Postgres (to read/act on escalations, residents,
+ * documents) and are registered only when `JWT_SECRET` is set — a
+ * deployment that doesn't want this surface at all simply omits it and
+ * `/admin/*` doesn't exist. Document upload specifically
+ * (adminDocumentsRoutes.ts, the dashboard's "upload a document" form)
+ * widens this further: it genuinely needs GEMINI_API_KEY (to embed the
+ * document) and GCP_STORAGE_BUCKET (to store the raw file) — the two
+ * credentials this function's admin-routes stub otherwise deliberately
+ * avoids requiring — so those routes are mounted only when
+ * GCP_STORAGE_BUCKET is *also* set, on top of JWT_SECRET; a deployment
+ * with JWT_SECRET but no GCP_STORAGE_BUCKET still gets
+ * escalations/residents management, just not document upload.
  */
 export async function createGateway() {
   const env = await loadEnvAsync();
@@ -226,10 +241,35 @@ export async function createGateway() {
       escalationTool: createEscalationTool({ whatsapp: unusedWhatsapp }),
       auditLog: createAuditLogWriter(),
     });
-    registerAdminRoutes(app, {
-      authConfig: adminAuthConfigFromEnv(env),
-      escalationModule,
+    const authConfig = adminAuthConfigFromEnv(env);
+    registerAdminRoutes(app, { authConfig, escalationModule });
+
+    // Resident roster management — HLD Sec 15 field-level encryption
+    // stays entirely inside residentsTool; this route file never sees
+    // ciphertext (see gateway/adminResidentsRoutes.ts's own comment).
+    registerAdminResidentsRoutes(app, {
+      authConfig,
+      residentsTool: createResidentsTool({
+        fieldEncryption: createFieldEncryption(fieldEncryptionConfigFromEnv(env)),
+      }),
     });
+
+    registerAdminDashboard(app);
+
+    // See this function's own doc comment for why document upload needs
+    // its own, wider gate than the rest of /admin/*.
+    if (env.GCP_STORAGE_BUCKET) {
+      await app.register(multipart);
+      registerAdminDocumentsRoutes(app, {
+        authConfig,
+        documentsModule: createDocumentsModule(getPostgresClient(), createVectorStore(env)),
+        documentStorage: createDocumentStorage({ bucket: env.GCP_STORAGE_BUCKET }),
+      });
+    } else {
+      app.log.warn(
+        'GCP_STORAGE_BUCKET not set — /admin/documents (dashboard document upload) not mounted. Escalations and residents management are still available.',
+      );
+    }
   }
 
   return { app, env };

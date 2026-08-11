@@ -382,6 +382,12 @@ aes-256-cbc` → `gsutil cp`, 90-day retention.
 
 - **Phase 1**: Broadcast, FAQs, Complaints, Suggestions
 - **Phase 2**: Visitor Management, Maintenance Tracking, Committee Dashboard, Analytics
+  — the Committee Dashboard slice is **partially implemented**: a
+  secretary-facing admin dashboard (`GET /admin/dashboard`,
+  `gateway/adminDashboard.ts`) for society document upload/management and
+  resident roster CRUD. See [`docs/admin-dashboard.md`](docs/admin-dashboard.md).
+  Visitor Management, Maintenance Tracking, and Analytics remain
+  unimplemented.
 - **Phase 3**: Voice Assistant, Multilingual Support, Image Understanding, Smart Notifications, Predictive Maintenance
 
 ## 12. Working Conventions for This Repo
