@@ -133,7 +133,16 @@ services:
     environment:
       POSTGRES_DB: ai_housing_secretary
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      # Was hardcoded to the literal "postgres" — meant to match
+      # .env.example's own default DATABASE_URL password, but silently
+      # diverges the moment anyone changes DATABASE_URL's password
+      # without separately updating this file too (Postgres only reads
+      # POSTGRES_PASSWORD once, at first init of an empty data volume, so
+      # the two can drift apart for good with no error until the app
+      # actually tries to connect). Parameterized from the same .env so
+      # there's exactly one place the password is set; still defaults to
+      # "postgres" if unset, matching .env.example unchanged.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
