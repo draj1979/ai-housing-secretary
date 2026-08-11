@@ -15,16 +15,26 @@
 # push jobs deliberately don't (an environment-scoped GitHub OIDC subject
 # that WIF auth couldn't be gotten working against).
 #
-# Triggered by `workflow_run` watching the "CI" workflow (.github/workflows/ci.yml)
-# rather than its own `push:` trigger, on purpose: this reuses CI's
-# already-completed lint/typecheck/test/guardrails/docker-build result
-# instead of re-running those checks a second time (cheaper, and there's
-# only one place — ci.yml — that defines what "passing" means).
-# `branches: [main, develop]` on the trigger narrows this to CI runs on
-# either of those two branches; each job's own `if:` then checks
-# `github.event.workflow_run.head_branch` to pick exactly one track — see
-# each job for its own gate (a *completed* run isn't necessarily a
-# *successful* one either, which the same `if:` also checks).
+# Triggered by a plain `push:` to main/develop — NOT `workflow_run`
+# watching CI (.github/workflows/ci.yml), despite that being the more
+# obviously "correct" design (reuse CI's already-completed result instead
+# of re-running lint/typecheck/test/guardrails/docker-build a second
+# time). Switched after live-verifying that `google-github-actions/auth`
+# (WIF) fails 100% of the time — every attempt, every subject variant,
+# correct IAM bindings and secrets notwithstanding — inside a
+# `workflow_run`-triggered job specifically, in a way that plain `push`-
+# triggered jobs on the exact same repo/provider/service-account don't
+# (isolated with a throwaway debug workflow: identical WIF config
+# succeeded immediately under `push`, failed immediately under
+# `workflow_run`). GCP's own IAM Policy Troubleshooter couldn't explain
+# it either (doesn't support evaluating workload-identity-federation
+# principals at all). Root cause of *why* `workflow_run` breaks WIF specifically
+# is unresolved — plausibly a GitHub Actions OIDC-token-claims quirk for
+# that trigger type — but `push` is simple, well-supported, and this
+# repo's branch protection already requires CI to pass before a merge can
+# land on main/develop, so re-running CI's checks isn't actually being
+# skipped by switching: they already ran, and had to pass, before this
+# workflow's `push` trigger can ever fire on either branch.
 #
 # No GCP service account key anywhere in this file — auth is Workload
 # Identity Federation via google-github-actions/auth, exchanging GitHub's
@@ -72,9 +82,7 @@
 name: CD
 
 on:
-  workflow_run:
-    workflows: ['CI']
-    types: [completed]
+  push:
     branches: [main, develop]
 
 permissions:
@@ -92,12 +100,10 @@ jobs:
   build-and-push-production:
     name: 'Build & Push Image (production)'
     runs-on: ubuntu-latest
-    # workflow_run always fires on completion, success or failure, for
-    # either watched branch — both halves of this check matter: only a
-    # *successful* CI run, and only one that ran on *main*.
-    if: |
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main'
+    # `push:` fires this whole workflow for both main and develop —
+    # each job picks its own branch here (only one of
+    # build-and-push-production/-staging ever actually runs per push).
+    if: github.ref == 'refs/heads/main'
 
     # Never cancel an in-progress production deploy for a newer push —
     # queue instead, so two overlapping runs can't push half-finished/
@@ -134,12 +140,12 @@ jobs:
       - name: Checkout (commit CI actually tested)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
 
       - name: Compute short SHA
         id: sha
         run: |
-          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          FULL_SHA="${{ github.sha }}"
           echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       # WIF — exchanges GitHub's OIDC token for a short-lived GCP access
@@ -223,12 +229,12 @@ jobs:
       - name: Checkout (commit CI actually tested)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
 
       - name: Compute short SHA
         id: sha
         run: |
-          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          FULL_SHA="${{ github.sha }}"
           echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GCP (Workload Identity Federation)
@@ -366,9 +372,9 @@ jobs:
       - name: Write deploy summary
         if: success()
         env:
-          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
-          COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
-          COMMIT_URL: ${{ github.event.workflow_run.head_commit.url }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
           TAG: ${{ steps.sha.outputs.short }}
           APPROVER: ${{ steps.approver.outputs.login }}
         run: |
@@ -403,9 +409,7 @@ jobs:
   build-and-push-staging:
     name: 'Build & Push Image (staging)'
     runs-on: ubuntu-latest
-    if: |
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'develop'
+    if: github.ref == 'refs/heads/develop'
 
     concurrency:
       group: cd-staging
@@ -424,12 +428,12 @@ jobs:
       - name: Checkout (commit CI actually tested)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
 
       - name: Compute short SHA
         id: sha
         run: |
-          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          FULL_SHA="${{ github.sha }}"
           echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GCP (Workload Identity Federation)
@@ -479,12 +483,12 @@ jobs:
       - name: Checkout (commit CI actually tested)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
 
       - name: Compute short SHA
         id: sha
         run: |
-          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          FULL_SHA="${{ github.sha }}"
           echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GCP (Workload Identity Federation)
@@ -569,9 +573,9 @@ jobs:
       - name: Write deploy summary
         if: success()
         env:
-          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
-          COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
-          COMMIT_URL: ${{ github.event.workflow_run.head_commit.url }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
           TAG: staging-${{ steps.sha.outputs.short }}
         run: |
           COMMIT_SUBJECT="$(printf '%s' "${COMMIT_MESSAGE}" | head -n1 | sed 's/|/\\|/g')"
