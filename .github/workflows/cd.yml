@@ -136,24 +136,39 @@ jobs:
           FULL_SHA="${{ github.sha }}"
           echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
-      # Direct WIF — exchanges GitHub's OIDC token for a short-lived GCP
-      # access token representing this run's own federated identity
-      # (no service-account impersonation — see this file's header
-      # comment), scoped to whatever's granted directly to the
-      # `attribute.repository` principalSet (artifactregistry.writer on
-      # this one repo, nothing project-wide). token_format=access_token
-      # is what docker/login-action below consumes; no key file, nothing
-      # to revoke afterward because nothing long-lived was issued.
+      # Direct WIF — writes an ADC credentials file backed by this run's
+      # own federated identity (no service-account impersonation — see
+      # this file's header comment), authorized for whatever's granted
+      # directly to the `attribute.repository` principalSet
+      # (artifactregistry.writer on this one repo, nothing project-wide).
+      # No `token_format:` here on purpose — google-github-actions/auth's
+      # `token_format: access_token` output unconditionally requires
+      # impersonating a `service_account:` (it errors without one, even
+      # under Direct WIF), so instead the next two steps mint an access
+      # token straight from this ADC file via `gcloud auth
+      # print-access-token` — that call itself needs no impersonation,
+      # since it's just exchanging the federated credential already on
+      # disk for an OAuth token representing the *same* identity.
       - name: Authenticate to GCP (Workload Identity Federation)
-        id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          token_format: access_token
 
-      # Registry login uses the WIF access token above directly — no
-      # separate `gcloud auth configure-docker` / gcloud CLI install
-      # needed on the runner.
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Mint an access token for Docker login
+        id: auth
+        run: |
+          TOKEN="$(gcloud auth print-access-token)"
+          # Unlike google-github-actions/auth's own access_token output
+          # (auto-masked by that action), a manually-minted token isn't
+          # masked in logs unless registered explicitly.
+          echo "::add-mask::${TOKEN}"
+          echo "access_token=${TOKEN}" >> "$GITHUB_OUTPUT"
+
+      # Registry login uses the access token above directly — no
+      # `gcloud auth configure-docker` needed.
       - name: Log in to Artifact Registry
         uses: docker/login-action@v3
         with:
@@ -421,12 +436,26 @@ jobs:
           FULL_SHA="${{ github.sha }}"
           echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
+      # See build-and-push-production's identical steps for why this is
+      # split into auth (no token_format) + setup-gcloud + print-access-token
+      # rather than a single `token_format: access_token` auth step.
       - name: Authenticate to GCP (Workload Identity Federation)
-        id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          token_format: access_token
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Mint an access token for Docker login
+        id: auth
+        run: |
+          TOKEN="$(gcloud auth print-access-token)"
+          # Unlike google-github-actions/auth's own access_token output
+          # (auto-masked by that action), a manually-minted token isn't
+          # masked in logs unless registered explicitly.
+          echo "::add-mask::${TOKEN}"
+          echo "access_token=${TOKEN}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Artifact Registry
         uses: docker/login-action@v3
