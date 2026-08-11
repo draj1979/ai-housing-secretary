@@ -94,9 +94,12 @@ it.
 One row per embedded chunk of a `knowledge_documents` row, produced by
 `scripts/ingest-knowledge.ts` and read by `PgVectorStore`
 (`src/memory/vectorStore.ts`) when `VECTOR_DB_PROVIDER=pgvector` (the
-default). `embedding` is a pgvector `vector(768)` column (768 = Gemini
-`text-embedding-004`'s output size, `EMBEDDING_DIMENSIONS` in
-`src/memory/embeddings.ts`); the `vector` extension is enabled by
+default). `embedding` is a pgvector `vector(3072)` column (3072 = Gemini
+`gemini-embedding-001`'s native output size, `EMBEDDING_DIMENSIONS` in
+`src/memory/embeddings.ts` — widened from 768 by
+`src/db/migrations/0005_brainy_rage.sql` after `text-embedding-004`,
+768-dim, was shut down 2026-01-14; see `embeddings.ts`'s own header
+comment for the full story); the `vector` extension is enabled by
 `src/db/migrations/0001_knowledge_chunks.sql`. `category` is a denormalized
 copy of the parent document's category so queries can filter without a
 join, mirroring the metadata Chroma stores per-chunk when
@@ -179,6 +182,20 @@ and applied by `pnpm db:migrate` (`src/db/migrate.ts`, using
 > removed afterward; it never touched the repo's own
 > `docker/docker-compose.yml` stack. Structural assertions also live in
 > `src/db/schema.test.ts`.
+
+> **Verified again for `0005_brainy_rage.sql`** (widens `embedding` from
+> `vector(768)` to `vector(3072)`, see this table's own entry above for
+> why): applied against a fresh throwaway `pgvector/pgvector:pg16`
+> container on top of `0000`-`0004`, confirmed via `\d knowledge_chunks`
+> that the column is really `vector(3072)`, and `src/db/schema.test.ts`
+> (which asserts the live column type matches `EMBEDDING_DIMENSIONS`)
+> passed. Then, not just the schema — a full real round trip: a genuine
+> `embedContent` call against the real Gemini API (`gemini-embedding-001`,
+> this session's real `GEMINI_API_KEY`) returned a 3072-length vector,
+> which was written through the real `PgVectorStore.upsertChunks` into
+> this same container and read back via `PgVectorStore.query`, returning
+> the correct chunk with a plausible cosine similarity score (~0.84) for
+> a genuinely related query. Scratch container removed afterward.
 
 ## Seeding
 

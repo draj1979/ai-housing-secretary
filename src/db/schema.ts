@@ -45,9 +45,11 @@ const ESCALATION_CATEGORY_VALUES = [
 
 // NOTE: duplicated (not imported) from memory/embeddings.ts EMBEDDING_DIMENSIONS,
 // for the same drizzle-kit CJS-loader reason as above. Kept in sync by
-// src/db/schema.test.ts. Gemini's text-embedding-004 (config/env.ts
-// EMBEDDING_MODEL default) outputs 768-dimensional vectors.
-const EMBEDDING_DIMENSIONS = 768;
+// src/db/schema.test.ts. Gemini's gemini-embedding-001 (config/env.ts
+// EMBEDDING_MODEL default) outputs 3072-dimensional vectors — see
+// memory/embeddings.ts's own header comment for why (text-embedding-004,
+// which output 768, was shut down 2026-01-14).
+const EMBEDDING_DIMENSIONS = 3072;
 
 /**
  * pgvector `vector(n)` column type (HLD Sec 5, 7.4). Requires the `vector`

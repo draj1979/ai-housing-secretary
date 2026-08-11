@@ -95,7 +95,11 @@ const envSchema = z.object({
   VECTOR_DB_PROVIDER: z.enum(['chroma', 'pgvector']).default('pgvector'),
   CHROMA_URL: z.string().optional(),
   CHROMA_COLLECTION: z.string().default('society_knowledge_base'),
-  EMBEDDING_MODEL: z.string().default('text-embedding-004'),
+  // text-embedding-004 was shut down 2026-01-14 — see
+  // memory/embeddings.ts's header comment for the full story (confirmed
+  // live) and why gemini-embedding-001's native 3072-dim output, not a
+  // truncated 768, is what this repo now stores.
+  EMBEDDING_MODEL: z.string().default('gemini-embedding-001'),
 
   // Auth / security
   JWT_SECRET: z.string().min(1).optional(),

@@ -2,8 +2,23 @@
  * memory/embeddings.ts
  *
  * Wraps the Gemini embedding model (config/env.ts EMBEDDING_MODEL, default
- * `text-embedding-004`) used to turn knowledge-base chunks and resident
+ * `gemini-embedding-001`) used to turn knowledge-base chunks and resident
  * queries into vectors for memory/vectorStore.ts (HLD Sec 5, 7.4).
+ *
+ * `gemini-embedding-001`, not `text-embedding-004`: the latter was fully
+ * shut down 2026-01-14 (confirmed live — a real embedContent call against
+ * it 404s; `GET /v1beta/models` no longer lists it at all). Also confirmed
+ * live: the `@google/generative-ai` SDK this file (and only this file —
+ * every other Gemini call site in this repo uses `generateContent`, still
+ * working fine on this SDK) uses is itself deprecated upstream (superseded
+ * by `@google/genai`) and its `EmbedContentRequest` type has no
+ * `outputDimensionality` field, so there's no way to ask this model for
+ * anything but its native output size — see EMBEDDING_DIMENSIONS below.
+ * Migrating the SDK itself (which *would* support truncating back to 768,
+ * avoiding the schema/re-ingest cost) was considered and deliberately not
+ * done here — out of proportion to this bug, since it'd touch every other
+ * Gemini call site in the repo for a one-file problem. Revisit if
+ * `@google/generative-ai` stops working for `generateContent` too.
  *
  * Two task types are used deliberately (per Gemini's embedding API): content
  * being *stored* is embedded as RETRIEVAL_DOCUMENT, content being *searched
@@ -15,14 +30,17 @@ import { GoogleGenerativeAI, TaskType } from '@google/generative-ai';
 import { loadEnv } from '../config/env.js';
 
 /**
- * Output dimensionality of `text-embedding-004`. Canonical source of truth —
+ * Output dimensionality of `gemini-embedding-001` (confirmed live — a real
+ * embedContent call returns a 3072-length vector; there is no smaller
+ * native option and this SDK can't request the API's `outputDimensionality`
+ * truncation, see this file's header comment). Canonical source of truth —
  * duplicated (not imported) into db/schema.ts as EMBEDDING_DIMENSIONS
  * because drizzle-kit's CJS schema loader can't resolve cross-file ESM
  * imports out of this package; kept in sync by src/db/schema.test.ts. If you
  * change EMBEDDING_MODEL to a model with a different output size, update
  * both places and regenerate the migration.
  */
-export const EMBEDDING_DIMENSIONS = 768;
+export const EMBEDDING_DIMENSIONS = 3072;
 
 export type EmbeddingPurpose = 'document' | 'query';
 

@@ -76,13 +76,21 @@ JSON-stringified into a single `metadataJson` field and parsed back on read.
 
 ### Embeddings (`embeddings.ts`)
 
-Wraps Gemini's `text-embedding-004` (`config/env.ts` `EMBEDDING_MODEL`).
-Two task types matter: content being **stored** is embedded as
-`RETRIEVAL_DOCUMENT`, content being **searched for** as `RETRIEVAL_QUERY` —
-Gemini optimizes the vector space differently for each, so
-`embedText`/`embedBatch` take an explicit `'document' | 'query'` purpose
-rather than a single embed function. `EMBEDDING_DIMENSIONS = 768` here is
-the canonical source of truth for the vector column width.
+Wraps Gemini's `gemini-embedding-001` (`config/env.ts` `EMBEDDING_MODEL`) —
+not `text-embedding-004`, which was shut down 2026-01-14 (confirmed live
+against the real Gemini API: a real `embedContent` call 404s, and
+`GET /v1beta/models` no longer lists it at all — see `embeddings.ts`'s
+own header comment for the full story, including why this repo stayed on
+the now-deprecated `@google/generative-ai` SDK rather than migrating to
+`@google/genai` to fix it). Two task types matter: content being
+**stored** is embedded as `RETRIEVAL_DOCUMENT`, content being **searched
+for** as `RETRIEVAL_QUERY` — Gemini optimizes the vector space
+differently for each, so `embedText`/`embedBatch` take an explicit
+`'document' | 'query'` purpose rather than a single embed function.
+`EMBEDDING_DIMENSIONS = 3072` here (`gemini-embedding-001`'s native
+output size — this SDK can't request the API's `outputDimensionality`
+truncation back to 768) is the canonical source of truth for the vector
+column width.
 
 ### Chunking (`chunking.ts`)
 

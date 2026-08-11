@@ -1,0 +1,16 @@
+-- Gemini's text-embedding-004 (768-dim) was shut down 2026-01-14 —
+-- confirmed live via a real embedContent call (404, model no longer
+-- listed). Its replacement, gemini-embedding-001, natively outputs
+-- 3072-dim vectors; the SDK this repo uses (memory/embeddings.ts) can't
+-- request the API's outputDimensionality truncation back to 768 (see
+-- that file's own header comment), so the column itself has to change.
+--
+-- SAFE ONLY FOR AN EMPTY (or throwaway/re-ingestable) `knowledge_chunks`
+-- TABLE: any existing 768-dim rows are NOT re-embedded by this migration
+-- — they'll either fail to insert-compare against new 3072-dim query
+-- vectors, or (Postgres) fail this ALTER outright if pgvector rejects
+-- the implicit cast. Re-run `pnpm knowledge:ingest` after this migration
+-- to regenerate every row at the new dimension — this repo has never
+-- had a real deployment with real production knowledge-base data yet
+-- (see CLAUDE.md's Status section), so there's nothing to backfill here.
+ALTER TABLE "knowledge_chunks" ALTER COLUMN "embedding" SET DATA TYPE vector(3072);
