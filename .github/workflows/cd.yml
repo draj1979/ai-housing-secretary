@@ -21,29 +21,40 @@
 # so a direct `push:` trigger doesn't skip that check, just avoids an
 # extra layer of indirection.
 #
-# No GCP service account key anywhere in this file, and (as of the WIF
-# rework below) no service-account *impersonation* either — auth is
-# **Direct** Workload Identity Federation: `google-github-actions/auth`
-# exchanges GitHub's own OIDC token for short-lived GCP credentials that
-# represent the GitHub Actions run's own federated identity directly,
-# with IAM roles (artifactregistry.writer on the one Artifact Registry
-# repo; compute.osAdminLogin + iap.tunnelResourceAccessor on each target
-# VM) granted straight to that identity — a `principalSet` scoped to
-# `attribute.repository` (this repo only; see the pool provider's own
-# `attributeCondition`), so it covers every ref/environment without
-# needing an exact subject-string match. This replaced an earlier design
-# that impersonated a dedicated `github-deployer@` service account
-# (`service_account:` + `roles/iam.workloadIdentityUser` bound to exact
-# subjects) — abandoned after the impersonation call
-# (`iam.serviceAccounts.getAccessToken`) was denied on every single
-# attempt, for every subject variant tried, with correct-looking IAM
-# bindings and secrets, and no explanation available from GCP's own IAM
-# Policy Troubleshooter (which doesn't support evaluating
-# workload-identity-federation principals at all) or from Cloud Logging
-# (Data Access audit logs for this call aren't on by default). The
-# non-impersonated, direct-credential flow was confirmed working in every
-# test that used it — hence this design instead of continuing to chase
-# the impersonation failure.
+# No GCP service account key anywhere in this file. Auth is a **hybrid**
+# of two WIF flows, split by what each job actually needs to do —
+# deliberately, after live-testing both ends of this:
+#
+#   - build-and-push-* — **Direct** WIF, no impersonation.
+#     `google-github-actions/auth` exchanges GitHub's OIDC token for
+#     short-lived GCP credentials representing the run's own federated
+#     identity directly. `roles/artifactregistry.writer` on the one
+#     Artifact Registry repo is granted straight to that identity — a
+#     `principalSet` scoped to `attribute.repository` (this repo only;
+#     see the pool provider's own `attributeCondition`), covering every
+#     ref/environment with no exact subject-string match needed. Confirmed
+#     working live.
+#   - deploy-* — impersonates `github-deployer@` (`service_account:` +
+#     `roles/iam.workloadIdentityUser`). Direct WIF does *not* work here:
+#     `gcloud compute ssh`/`scp` (OS Login) rejects raw federated
+#     credentials outright — confirmed live with `INVALID_ARGUMENT:
+#     Workload identities are not supported.` — so these two jobs need an
+#     impersonated *real* identity instead. This is narrower than an
+#     earlier, abandoned attempt to impersonate github-deployer@ with
+#     `token_format: access_token` for the build/push jobs, which failed
+#     every single time (`iam.serviceAccounts.getAccessToken` denied, no
+#     explanation available from GCP's IAM Policy Troubleshooter — doesn't
+#     support evaluating WIF principals — or Cloud Logging, Data Access
+#     audit logs for that call aren't on by default): no `token_format`
+#     here, so `google-github-actions/auth` just writes an ADC file
+#     describing the impersonation, and `gcloud` calls
+#     `generateAccessToken` itself, lazily, only when it actually needs a
+#     token — which works, unlike the eager upfront call `token_format:
+#     access_token` makes. `github-deployer@` also needs
+#     `roles/compute.osAdminLogin` + `roles/iap.tunnelResourceAccessor`
+#     (scoped to each target VM) and `roles/compute.viewer`
+#     (project-level — `gcloud compute ssh`/`scp` needs
+#     `compute.projects.get` before it can even attempt the IAP tunnel).
 #
 # GCE_VM_NAME/GCE_VM_ZONE are deliberately *not* repo-level variables —
 # they're set per-Environment (Settings -> Environments -> production /
@@ -241,12 +252,27 @@ jobs:
           FULL_SHA="${{ github.sha }}"
           echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
+      # Impersonates github-deployer@ here — unlike the build/push jobs
+      # above, this one is NOT Direct WIF: `gcloud compute ssh`/`scp`
+      # (OS Login) categorically rejects raw workload-identity-federation
+      # credentials ("INVALID_ARGUMENT: Workload identities are not
+      # supported", confirmed live), so SSH-based deploy jobs specifically
+      # need a real identity — an impersonated service account satisfies
+      # that where a direct federated credential can't. This is a
+      # narrower, working case of the impersonation flow that broke for
+      # `token_format: access_token` elsewhere in this file: no
+      # `token_format` here, so `google-github-actions/auth` just writes
+      # an ADC file describing the impersonation, and `gcloud`
+      # lazily/transparently calls `generateAccessToken` itself only when
+      # it actually needs a token — which succeeds, unlike the eager
+      # upfront call `token_format: access_token` makes.
       - name: Authenticate to GCP (Workload Identity Federation)
         id: auth
         uses: google-github-actions/auth@v2
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
       # gcloud CLI, wired to the WIF credentials the auth step above just
       # minted — `gcloud compute ssh`/`scp` below need the CLI itself,
@@ -258,8 +284,9 @@ jobs:
       # OS Login + IAP mechanism scripts/provision-gcp.sh (enables OS
       # Login) sets up — `roles/compute.osAdminLogin` +
       # `roles/iap.tunnelResourceAccessor`, scoped to this one instance,
-      # granted directly to the `attribute.repository` principalSet (see
-      # this file's header comment) — no SSH key pair to manage,
+      # granted to `github-deployer@` (see this file's header comment for
+      # why this job impersonates a service account rather than using
+      # Direct WIF like the build/push jobs) — no SSH key pair to manage,
       # gcloud generates and registers an ephemeral one per run via the
       # OS Login API. `--quiet` suppresses interactive prompts (safe to
       # always answer yes non-interactively here — there's nothing to
@@ -504,12 +531,16 @@ jobs:
           FULL_SHA="${{ github.sha }}"
           echo "short=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
+      # See deploy-production's identical step for why this impersonates
+      # github-deployer@ rather than using Direct WIF like the build/push
+      # jobs — OS Login rejects raw federated credentials outright.
       - name: Authenticate to GCP (Workload Identity Federation)
         id: auth
         uses: google-github-actions/auth@v2
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
